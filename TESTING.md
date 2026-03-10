@@ -8,19 +8,19 @@ This document explains how to test both the PR Review and Auto-Fix features.
 
 PR Review is triggered automatically when a pull request is opened or updated.
 
-### Test Branch: `test/pr-review-bugs-v3`
+### Test Branch: `test/pr-review-v4`
 
-This branch contains `test_app/calculator.py` with intentional bugs for testing.
+This branch contains `test_app/sample.py` with intentional bugs for testing.
 
 ### How to Test
 
 1. **Create the PR** (one-time setup):
    ```bash
    # Go to GitHub and create a PR:
-   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-bugs-v3
+   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-v4
    # 
    # Or use gh CLI:
-   gh pr create --base main --head test/pr-review-bugs-v3 \
+   gh pr create --base main --head test/pr-review-v4 \
      --title "TEST: PR Review with intentional bugs" \
      --body "This PR tests the Ghost Review PR analysis feature. It contains intentional security issues and bugs that should be detected."
    ```
@@ -255,6 +255,14 @@ These issues have been fixed in the current version:
 
 4. **Auto-fix giving up too early**
    - Fixed: Added better ReAct prompts and exploration strategy
+
+5. **Workflow hanging for 10-20 minutes with no output**
+   - Fixed: Reduced HTTP timeout from 300s to 60s
+   - Fixed: Added health check before requests
+   - Fixed: Added `--timeout 120` to llama-server
+   - Fixed: Added overall 8-minute timeout guard to review
+   - Fixed: Added real-time progress logging
+   - Cause: Was waiting indefinitely for model response
 
 ---
 
