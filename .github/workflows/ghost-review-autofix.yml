@@ -8,9 +8,6 @@ on:
 
 jobs:
   auto-fix:
-    # Trigger on:
-    #   a) "/fix" comment on an issue (not a PR) from a write+ user
-    #   b) "auto-fix" label applied to an issue
     if: |
       (
         github.event_name == 'issue_comment' &&
@@ -25,9 +22,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     permissions:
-      issues:        write   # post status comments
-      contents:      write   # create branches and commit patches
-      pull-requests: write   # create draft PRs
+      issues:        write
+      contents:      write
+      pull-requests: write
 
     timeout-minutes: 35
 
@@ -40,7 +37,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ── Gate 1: Verify actor has write permission ──────────────────
       - name: Verify actor permission
         id: perms
         uses: actions/github-script@v7
@@ -64,31 +60,18 @@ jobs:
             console.log(`Actor: ${actor} | Permission: ${permission} | Allowed: ${allowed}`);
             core.setOutput('allowed', String(allowed));
 
-      # All subsequent steps only run if permission check passed.
-
       - name: Configure git identity
         if: steps.perms.outputs.allowed == 'true'
         run: |
           git config user.name  "GhostReview[bot]"
           git config user.email "ghost-review-bot@users.noreply.github.com"
 
-      # ── Install build dependencies for llama.cpp ───────────────────
       - name: Install build dependencies
         if: steps.perms.outputs.allowed == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential cmake git
 
-      # ── Cache: llama.cpp binary ────────────────────────────────────
-      - name: Cache llama.cpp binary
-        if: steps.perms.outputs.allowed == 'true'
-        uses: actions/cache@v4
-        id: llama-cache
-        with:
-          path: ~/.cache/ghost-review/llama-bin
-          key: ghost-review-llama-b8252-ubuntu-arm64
-
-      # ── Cache: Python packages ─────────────────────────────────────
       - name: Cache Python packages
         if: steps.perms.outputs.allowed == 'true'
         uses: actions/cache@v4
@@ -97,14 +80,12 @@ jobs:
           key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
           restore-keys: ghost-review-pip-
 
-      # ── Install Python dependencies ────────────────────────────────
       - name: Install Python dependencies
         if: steps.perms.outputs.allowed == 'true'
         run: |
           pip install -q -r .github/scripts/requirements.txt \
             --break-system-packages
 
-      # ── Detect runner config (sets MODEL_SIZE env var) ─────────────
       - name: Detect runner configuration
         if: steps.perms.outputs.allowed == 'true'
         id: detect
@@ -113,7 +94,20 @@ jobs:
           detect_runner_config
           echo "model_size=${MODEL_SIZE}" >> "$GITHUB_OUTPUT"
 
-      # ── Cache: GGUF model file (only the one we'll use) ────────────
+      - name: Cache llama.cpp binary
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-b8252-ubuntu-arm64-v2
+
+      - name: Build llama.cpp
+        if: steps.perms.outputs.allowed == 'true' && steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          source .github/scripts/lib/build.sh
+          build_llama_cpp_if_needed
+
       - name: Cache LLM model
         if: steps.perms.outputs.allowed == 'true'
         uses: actions/cache@v4
@@ -122,12 +116,36 @@ jobs:
           path: ~/.cache/ghost-review/models
           key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
 
-      # ── Setup: build llama.cpp + download model + start server ─────
-      - name: Setup inference engine
-        if: steps.perms.outputs.allowed == 'true'
-        run: bash .github/scripts/setup_inference.sh
+      - name: Download model
+        if: steps.perms.outputs.allowed == 'true' && steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          source .github/scripts/lib/download.sh
+          download_models_if_needed
 
-      # ── Run auto-fix ───────────────────────────────────────────────
+      - name: Start inference server
+        if: steps.perms.outputs.allowed == 'true'
+        run: |
+          source .github/scripts/lib/server.sh
+          source .github/scripts/lib/detect.sh
+          detect_runner_config
+          
+          echo "::group::Start llama-server"
+          if [[ "$RUNNER_VCPUS" -ge 4 ]] && [[ "$MODEL_SIZE" == "7b" ]]; then
+              start_server_4vcpu_7b
+          elif [[ "$RUNNER_VCPUS" -lt 4 ]] && [[ "$MODEL_SIZE" == "3b" ]]; then
+              start_server_2vcpu_3b
+          elif [[ "$RUNNER_VCPUS" -lt 4 ]] && [[ "$MODEL_SIZE" == "7b" ]]; then
+              start_server_2vcpu_7b
+          else
+              start_server_2vcpu_3b
+          fi
+          echo "::endgroup::"
+          
+          {
+              echo "LLAMA_SERVER_URL=http://127.0.0.1:8080"
+              echo "GHOST_REVIEW_MODEL=qwen2.5-coder-${MODEL_SIZE}-instruct-q4_k_m"
+          } >> "$GITHUB_ENV"
+
       - name: Run auto-fix
         if: steps.perms.outputs.allowed == 'true'
         env:

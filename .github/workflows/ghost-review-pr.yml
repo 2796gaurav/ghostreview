@@ -17,44 +17,32 @@ concurrency:
 
 jobs:
   review:
-    # ARM64 Cobalt 100 runner: 4-vCPU, 16 GB RAM, free for public repos.
-    # This activates llama.cpp's Neon/i8MM/SVE2 AArch64 SIMD paths.
     runs-on: ubuntu-24.04-arm
 
-    # Skip draft PRs unless triggered manually.
     if: |
       github.event.pull_request.draft == false ||
       github.event_name == 'workflow_dispatch'
 
     permissions:
-      pull-requests: write  # post review comments
-      contents: read        # read diff and source files
+      pull-requests: write
+      contents: read
 
     timeout-minutes: 30
 
     env:
-      # Override model selection: "" = auto, "7b" = force 7B, "3b" = force 3B
       MODEL_SIZE_OVERRIDE: ""
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history for accurate diffs
+          fetch-depth: 0
 
-      # ── Install build dependencies for llama.cpp ───────────────────
+      # ── Install build dependencies ─────────────────────────────────
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential cmake git
-
-      # ── Cache: llama.cpp binary ────────────────────────────────────
-      - name: Cache llama.cpp binary
-        uses: actions/cache@v4
-        id: llama-cache
-        with:
-          path: ~/.cache/ghost-review/llama-bin
-          key: ghost-review-llama-b8252-ubuntu-arm64
 
       # ── Cache: Python packages ─────────────────────────────────────
       - name: Cache Python packages
@@ -70,13 +58,28 @@ jobs:
           pip install -q -r .github/scripts/requirements.txt \
             --break-system-packages
 
-      # ── Detect runner config (sets MODEL_SIZE env var) ─────────────
+      # ── Detect runner config FIRST (sets MODEL_SIZE) ───────────────
       - name: Detect runner configuration
         id: detect
         run: |
           source .github/scripts/lib/detect.sh
           detect_runner_config
           echo "model_size=${MODEL_SIZE}" >> "$GITHUB_OUTPUT"
+
+      # ── Cache: llama.cpp binary (conditional on detect) ────────────
+      - name: Cache llama.cpp binary
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-b8252-ubuntu-arm64-v2
+
+      # ── Build llama.cpp if not cached ──────────────────────────────
+      - name: Build llama.cpp
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          source .github/scripts/lib/build.sh
+          build_llama_cpp_if_needed
 
       # ── Cache: GGUF model file (only the one we'll use) ────────────
       - name: Cache LLM model
@@ -86,9 +89,37 @@ jobs:
           path: ~/.cache/ghost-review/models
           key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
 
-      # ── Setup: build llama.cpp + download model + start server ─────
-      - name: Setup inference engine
-        run: bash .github/scripts/setup_inference.sh
+      # ── Download model if not cached ───────────────────────────────
+      - name: Download model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          source .github/scripts/lib/download.sh
+          download_models_if_needed
+
+      # ── Start llama-server ─────────────────────────────────────────
+      - name: Start inference server
+        run: |
+          source .github/scripts/lib/server.sh
+          source .github/scripts/lib/detect.sh
+          detect_runner_config
+          
+          echo "::group::Start llama-server"
+          if [[ "$RUNNER_VCPUS" -ge 4 ]] && [[ "$MODEL_SIZE" == "7b" ]]; then
+              start_server_4vcpu_7b
+          elif [[ "$RUNNER_VCPUS" -lt 4 ]] && [[ "$MODEL_SIZE" == "3b" ]]; then
+              start_server_2vcpu_3b
+          elif [[ "$RUNNER_VCPUS" -lt 4 ]] && [[ "$MODEL_SIZE" == "7b" ]]; then
+              start_server_2vcpu_7b
+          else
+              start_server_2vcpu_3b
+          fi
+          echo "::endgroup::"
+          
+          # Export for later steps
+          {
+              echo "LLAMA_SERVER_URL=http://127.0.0.1:8080"
+              echo "GHOST_REVIEW_MODEL=qwen2.5-coder-${MODEL_SIZE}-instruct-q4_k_m"
+          } >> "$GITHUB_ENV"
 
       # ── Run the 4-pass PR review ───────────────────────────────────
       - name: Run PR review

@@ -73,8 +73,18 @@ _start_server() {
     # Verify binary exists
     if [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
         echo "ERROR: llama-server not found at $LLAMA_SERVER_BIN"
-        exit 1
+        echo "Checking if available in PATH..."
+        if command -v llama-server &> /dev/null; then
+            LLAMA_SERVER_BIN=$(which llama-server)
+            echo "Found llama-server in PATH: $LLAMA_SERVER_BIN"
+        else
+            echo "ERROR: llama-server not found in PATH either"
+            exit 1
+        fi
     fi
+
+    echo "Using llama-server: $LLAMA_SERVER_BIN"
+    "$LLAMA_SERVER_BIN" --version 2>&1 | head -1 || true
 
     "$LLAMA_SERVER_BIN" \
         --model              "$MODEL" \
@@ -106,10 +116,6 @@ _start_server() {
     echo "llama-server PID: $(cat "$LLAMA_PID_FILE")"
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Public start functions — one per supported configuration
-# ──────────────────────────────────────────────────────────────────────
-
 # 4-vCPU ARM64 / 16 GB RAM / 7B model
 start_server_4vcpu_7b() {
     _start_server \
@@ -124,7 +130,7 @@ start_server_4vcpu_7b() {
     wait_for_server 90
 }
 
-# 2-vCPU ARM64 / 8 GB RAM / 3B model (private repo default)
+# 2-vCPU ARM64 / 8 GB RAM / 3B model
 start_server_2vcpu_3b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-3b-instruct-q4_k_m.gguf" \
@@ -138,7 +144,7 @@ start_server_2vcpu_3b() {
     wait_for_server 60
 }
 
-# 2-vCPU ARM64 / 8 GB RAM / 7B model (opt-in via MODEL_SIZE_OVERRIDE=7b)
+# 2-vCPU ARM64 / 8 GB RAM / 7B model (opt-in)
 start_server_2vcpu_7b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
@@ -152,9 +158,7 @@ start_server_2vcpu_7b() {
     wait_for_server 90
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# stop_server — graceful shutdown at end of job
-# ──────────────────────────────────────────────────────────────────────
+# Stop server
 stop_server() {
     if [[ -f "$LLAMA_PID_FILE" ]]; then
         local PID
