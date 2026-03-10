@@ -86,6 +86,9 @@ _start_server() {
     echo "Using llama-server: $LLAMA_SERVER_BIN"
     "$LLAMA_SERVER_BIN" --version 2>&1 | head -1 || true
 
+    # New llama.cpp (b8252+) uses different flag syntax:
+    # --flash-attn on (instead of just --flash-attn)
+    # -fa is short form
     "$LLAMA_SERVER_BIN" \
         --model              "$MODEL" \
         --host               127.0.0.1 \
@@ -99,7 +102,7 @@ _start_server() {
         --parallel           "$PARALLEL" \
         --keep               "$KEEP" \
         --cache-reuse        256 \
-        --flash-attn \
+        --flash-attn         on \
         --mlock \
         --no-mmap \
         --cache-type-k       q8_0 \
