@@ -1,0 +1,98 @@
+name: Ghost Review — PR Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to re-review (leave blank for current)"
+        required: false
+        type: string
+
+# Prevent concurrent reviews on the same PR; cancel in-progress if new commit arrives.
+concurrency:
+  group: ghost-review-pr-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # ARM64 Cobalt 100 runner: 4-vCPU, 16 GB RAM, free for public repos.
+    # This activates llama.cpp's Neon/i8MM/SVE2 AArch64 SIMD paths.
+    runs-on: ubuntu-24.04-arm
+
+    # Skip draft PRs unless triggered manually.
+    if: |
+      github.event.pull_request.draft == false ||
+      github.event_name == 'workflow_dispatch'
+
+    permissions:
+      pull-requests: write  # post review comments
+      contents: read        # read diff and source files
+
+    timeout-minutes: 20
+
+    env:
+      # Pinned llama.cpp tag — bump to upgrade, invalidates binary cache.
+      LLAMA_CPP_VERSION: "b8252"
+      # Override model selection: "" = auto, "7b" = force 7B, "3b" = force 3B
+      MODEL_SIZE_OVERRIDE: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for accurate diffs
+
+      # ── Cache: llama-server binary (built from source on ARM64) ────
+      - name: Cache llama.cpp binary
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-${{ runner.os }}-${{ runner.arch }}-${{ env.LLAMA_CPP_VERSION }}
+
+      # ── Cache: GGUF model files (7B + 3B combined, ~6.9 GB) ────────
+      - name: Cache LLM models
+        uses: actions/cache@v4
+        id: model-cache
+        with:
+          path: ~/.cache/ghost-review/models
+          key: ghost-review-models-qwen2.5-coder-7b3b-q4km-v1
+          restore-keys: |
+            ghost-review-models-qwen2.5-coder-
+
+      # ── Cache: Python packages ─────────────────────────────────────
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
+          restore-keys: ghost-review-pip-
+
+      # ── Setup: build llama.cpp + download models + start server ────
+      - name: Setup inference engine
+        run: bash .github/scripts/setup_inference.sh
+
+      # ── Install Python dependencies ────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install -q -r .github/scripts/requirements.txt \
+            --break-system-packages
+
+      # ── Run the 4-pass PR review ───────────────────────────────────
+      - name: Run PR review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:    ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO:         ${{ github.repository }}
+          BASE_SHA:     ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:     ${{ github.event.pull_request.head.sha }}
+        run: python .github/scripts/review.py
+
+      # ── Cleanup: stop llama-server gracefully ─────────────────────
+      - name: Stop inference server
+        if: always()
+        run: |
+          source .github/scripts/lib/server.sh
+          stop_server

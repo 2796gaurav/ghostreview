@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Local development
+*.local
+.env
+.env.local
+
+# GitHub Actions cache (local testing)
+.cache/
+models/
+llama-bin/
+
+# Logs
+*.log

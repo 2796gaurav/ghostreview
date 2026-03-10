@@ -1,0 +1,125 @@
+name: Ghost Review — Auto-Fix
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [labeled]
+
+jobs:
+  auto-fix:
+    # Trigger on:
+    #   a) "/fix" comment on an issue (not a PR) from a write+ user
+    #   b) "auto-fix" label applied to an issue
+    if: |
+      (
+        github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '/fix') &&
+        github.event.issue.pull_request == null
+      ) ||
+      (
+        github.event_name == 'issues' &&
+        github.event.label.name == 'auto-fix'
+      )
+
+    runs-on: ubuntu-24.04-arm
+
+    permissions:
+      issues:        write   # post status comments
+      contents:      write   # create branches and commit patches
+      pull-requests: write   # create draft PRs
+
+    timeout-minutes: 25
+
+    env:
+      LLAMA_CPP_VERSION:   "b8252"
+      MODEL_SIZE_OVERRIDE: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Gate 1: Verify actor has write permission ──────────────────
+      # This check happens in the workflow itself (not just Python) so
+      # we fail fast before downloading any models.
+      - name: Verify actor permission
+        id: perms
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.actor;
+            let permission;
+            try {
+              const { data: p } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                username: actor,
+              });
+              permission = p.permission;
+            } catch (e) {
+              console.log(`Permission check failed for ${actor}: ${e}`);
+              core.setOutput('allowed', 'false');
+              return;
+            }
+            const allowed = ['admin', 'maintain', 'write'].includes(permission);
+            console.log(`Actor: ${actor} | Permission: ${permission} | Allowed: ${allowed}`);
+            core.setOutput('allowed', String(allowed));
+
+      # All subsequent steps only run if permission check passed.
+
+      - name: Configure git identity
+        if: steps.perms.outputs.allowed == 'true'
+        run: |
+          git config user.name  "GhostReview[bot]"
+          git config user.email "ghost-review-bot@users.noreply.github.com"
+
+      - name: Cache llama.cpp binary
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-${{ runner.os }}-${{ runner.arch }}-${{ env.LLAMA_CPP_VERSION }}
+
+      - name: Cache LLM models
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ghost-review/models
+          key: ghost-review-models-qwen2.5-coder-7b3b-q4km-v1
+          restore-keys: |
+            ghost-review-models-qwen2.5-coder-
+
+      - name: Cache Python packages
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
+          restore-keys: ghost-review-pip-
+
+      - name: Setup inference engine
+        if: steps.perms.outputs.allowed == 'true'
+        run: bash .github/scripts/setup_inference.sh
+
+      - name: Install Python dependencies
+        if: steps.perms.outputs.allowed == 'true'
+        run: |
+          pip install -q -r .github/scripts/requirements.txt \
+            --break-system-packages
+
+      - name: Run auto-fix
+        if: steps.perms.outputs.allowed == 'true'
+        env:
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER:  ${{ github.event.issue.number }}
+          REPO:          ${{ github.repository }}
+          ACTOR:         ${{ github.actor }}
+        run: python .github/scripts/auto_fix.py
+
+      - name: Stop inference server
+        if: always() && steps.perms.outputs.allowed == 'true'
+        run: |
+          source .github/scripts/lib/server.sh
+          stop_server
