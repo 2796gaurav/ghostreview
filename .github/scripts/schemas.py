@@ -204,3 +204,61 @@ VERIFY_SCHEMA = {
         }
     }
 }
+
+# ── Auto-Fix v2: Enhanced Action Schema with ReAct Pattern ───────────
+AGENT_ACTION_SCHEMA_V2 = {
+    "type": "object",
+    "required": ["thinking", "action", "action_params", "confidence"],
+    "additionalProperties": False,
+    "properties": {
+        "thinking": {
+            "type": "string",
+            "description": "Step-by-step reasoning about what to do next"
+        },
+        "reflection": {
+            "type": "string",
+            "description": "Self-critique and evaluation of approach"
+        },
+        "action": {
+            "type": "string",
+            "enum": ["read_file", "list_directory", "generate_patch", "finish", "give_up"]
+        },
+        "action_params": {
+            "type": "object",
+            "description": "Parameters specific to the chosen action"
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Confidence in this step (0.0-1.0)"
+        }
+    }
+}
+
+# ── Auto-Fix v2: Enhanced Verification Schema ─────────────────────────
+VERIFY_SCHEMA_V2 = {
+    "type": "object",
+    "required": ["correct", "verified_confidence", "concern"],
+    "additionalProperties": False,
+    "properties": {
+        "correct": {
+            "type": "boolean",
+            "description": "True if the patch correctly and safely fixes the issue"
+        },
+        "verified_confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Confidence that the patch is correct"
+        },
+        "concern": {
+            "type": "string",
+            "description": "Empty if correct=true; specific concerns if correct=false"
+        },
+        "suggested_improvements": {
+            "type": "string",
+            "description": "Optional suggestions to improve the patch"
+        }
+    }
+}
