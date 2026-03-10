@@ -29,7 +29,7 @@ jobs:
       contents:      write   # create branches and commit patches
       pull-requests: write   # create draft PRs
 
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     env:
       MODEL_SIZE_OVERRIDE: ""
@@ -41,8 +41,6 @@ jobs:
           fetch-depth: 0
 
       # ── Gate 1: Verify actor has write permission ──────────────────
-      # This check happens in the workflow itself (not just Python) so
-      # we fail fast before downloading any models.
       - name: Verify actor permission
         id: perms
         uses: actions/github-script@v7
@@ -74,6 +72,22 @@ jobs:
           git config user.name  "GhostReview[bot]"
           git config user.email "ghost-review-bot@users.noreply.github.com"
 
+      # ── Install build dependencies for llama.cpp ───────────────────
+      - name: Install build dependencies
+        if: steps.perms.outputs.allowed == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake git
+
+      # ── Cache: llama.cpp binary ────────────────────────────────────
+      - name: Cache llama.cpp binary
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-b8252-ubuntu-arm64
+
       # ── Cache: Python packages ─────────────────────────────────────
       - name: Cache Python packages
         if: steps.perms.outputs.allowed == 'true'
@@ -83,7 +97,7 @@ jobs:
           key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
           restore-keys: ghost-review-pip-
 
-      # ── Install Python dependencies FIRST (needed for setup) ───────
+      # ── Install Python dependencies ────────────────────────────────
       - name: Install Python dependencies
         if: steps.perms.outputs.allowed == 'true'
         run: |
@@ -108,7 +122,7 @@ jobs:
           path: ~/.cache/ghost-review/models
           key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
 
-      # ── Setup: download model + start server ───────────────────────
+      # ── Setup: build llama.cpp + download model + start server ─────
       - name: Setup inference engine
         if: steps.perms.outputs.allowed == 'true'
         run: bash .github/scripts/setup_inference.sh

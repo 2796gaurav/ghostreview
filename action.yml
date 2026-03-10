@@ -29,6 +29,19 @@ runs:
       with:
         fetch-depth: 0
 
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq build-essential cmake git
+
+    - name: Cache llama.cpp binary
+      uses: actions/cache@v4
+      id: llama-cache
+      with:
+        path: ~/.cache/ghost-review/llama-bin
+        key: ghost-review-llama-b8252-ubuntu-arm64
+
     - name: Cache Python packages
       uses: actions/cache@v4
       with:

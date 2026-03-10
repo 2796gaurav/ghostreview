@@ -30,7 +30,7 @@ jobs:
       pull-requests: write  # post review comments
       contents: read        # read diff and source files
 
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     env:
       # Override model selection: "" = auto, "7b" = force 7B, "3b" = force 3B
@@ -42,6 +42,20 @@ jobs:
         with:
           fetch-depth: 0  # full history for accurate diffs
 
+      # ── Install build dependencies for llama.cpp ───────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake git
+
+      # ── Cache: llama.cpp binary ────────────────────────────────────
+      - name: Cache llama.cpp binary
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: ~/.cache/ghost-review/llama-bin
+          key: ghost-review-llama-b8252-ubuntu-arm64
+
       # ── Cache: Python packages ─────────────────────────────────────
       - name: Cache Python packages
         uses: actions/cache@v4
@@ -50,7 +64,7 @@ jobs:
           key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
           restore-keys: ghost-review-pip-
 
-      # ── Install Python dependencies FIRST (needed for setup) ───────
+      # ── Install Python dependencies ────────────────────────────────
       - name: Install Python dependencies
         run: |
           pip install -q -r .github/scripts/requirements.txt \
@@ -72,7 +86,7 @@ jobs:
           path: ~/.cache/ghost-review/models
           key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
 
-      # ── Setup: download model + start server ───────────────────────
+      # ── Setup: build llama.cpp + download model + start server ─────
       - name: Setup inference engine
         run: bash .github/scripts/setup_inference.sh
 

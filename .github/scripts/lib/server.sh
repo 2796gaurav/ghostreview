@@ -4,14 +4,11 @@
 
 set -euo pipefail
 
-# llama-server is installed via pip in llama-cpp-python
+# Native llama-server built from source
 LLAMA_SERVER_BIN="${HOME}/.cache/ghost-review/llama-bin/llama-server"
 MODEL_DIR="$HOME/.cache/ghost-review/models"
 LLAMA_PID_FILE="/tmp/ghost-review-llama.pid"
 LLAMA_LOG_FILE="/tmp/ghost-review-llama.log"
-
-# Ensure llama-server is in PATH
-export PATH="${HOME}/.cache/ghost-review/llama-bin:$PATH"
 
 # ──────────────────────────────────────────────────────────────────────
 # wait_for_server — poll /health until 200 OK or timeout
@@ -73,13 +70,10 @@ _start_server() {
     echo "  Parallel   : ${PARALLEL} slots"
     echo "  KV keep    : ${KEEP} tokens"
 
-    # Use llama-server from pip package
-    if command -v llama-server &> /dev/null; then
-        LLAMA_SERVER_BIN=$(which llama-server)
-    elif [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
-        echo "ERROR: llama-server not found. Installing..."
-        pip install -q "llama-cpp-python[server]>=0.3.0"
-        LLAMA_SERVER_BIN=$(which llama-server)
+    # Verify binary exists
+    if [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
+        echo "ERROR: llama-server not found at $LLAMA_SERVER_BIN"
+        exit 1
     fi
 
     "$LLAMA_SERVER_BIN" \
