@@ -60,6 +60,7 @@ class FixResult:
     gave_up: bool = False
     reason: str = ""
     agent_thinking_trace: str = ""
+    iterations_used: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -221,7 +222,7 @@ async def run_agentic_fix(
       - confidence: float 0-1
 
     The orchestrator executes the action and feeds the result back.
-    Max 10 iterations (configurable higher only for more file reads, never fewer).
+    Max 12 iterations (configurable higher only for more file reads, never fewer).
     """
     MAX_ITERATIONS = 12
     CONFIDENCE_THRESHOLD = config.get("auto_fix", {}).get("confidence_threshold", 0.70)
@@ -231,12 +232,15 @@ async def run_agentic_fix(
     patches: list[PatchSpec] = []
     thinking_trace: list[str] = []
     conversation: list[dict[str, str]] = []
+    files_read: set[str] = set()
 
     initial_message = (
         f"Issue #{issue['number']}: {issue['title']}\n\n"
         f"Description:\n{sanitize(issue.get('body') or '', max_chars=3000)}\n\n"
         f"Repository structure:\n{file_tree}\n\n"
-        "Begin by identifying which files are relevant to this issue."
+        "Begin by identifying which files are relevant to this issue. "
+        "Use list_directory to explore, then read_file to understand the code, "
+        "then generate_patch to create fixes."
     )
     conversation.append({"role": "user", "content": initial_message})
 
@@ -262,7 +266,12 @@ async def run_agentic_fix(
             )
         except (LLMError, asyncio.TimeoutError) as exc:
             print(f"  Agent call failed on iteration {iteration+1}: {exc}")
-            break
+            return FixResult(
+                gave_up=True,
+                reason=f"LLM error on iteration {iteration+1}: {exc}",
+                agent_thinking_trace="\n\n".join(thinking_trace),
+                iterations_used=iteration + 1,
+            )
 
         action = result.get("action", "give_up")
         params = result.get("action_params") or {}
@@ -286,6 +295,7 @@ async def run_agentic_fix(
                 action_result = f"Contents of {file_path}:\n\n{content}"
                 if len(content) >= 8000:
                     action_result += "\n\n[File truncated at 8000 chars]"
+                files_read.add(file_path)
             else:
                 action_result = f"ERROR: File not found: {file_path}"
 
@@ -321,6 +331,8 @@ async def run_agentic_fix(
                 action_result = f"ERROR: Maximum of {MAX_FILES} files already staged"
             elif not patched:
                 action_result = "ERROR: patched_content is required"
+            elif fp not in files_read:
+                action_result = f"ERROR: You must read {fp} before patching it"
             else:
                 patch = PatchSpec(
                     file_path=fp,
@@ -343,6 +355,7 @@ async def run_agentic_fix(
                 gave_up=True,
                 reason=explanation,
                 agent_thinking_trace="\n\n".join(thinking_trace),
+                iterations_used=iteration + 1,
             )
 
         else:
@@ -353,11 +366,22 @@ async def run_agentic_fix(
             "content": f"Result:\n{action_result}\n\nContinue.",
         })
 
+    else:
+        # Max iterations reached without finish
+        if not patches:
+            return FixResult(
+                gave_up=True,
+                reason=f"Max iterations ({MAX_ITERATIONS}) reached without generating any patches.",
+                agent_thinking_trace="\n\n".join(thinking_trace),
+                iterations_used=MAX_ITERATIONS,
+            )
+
     if not patches:
         return FixResult(
             gave_up=True,
             reason="Agent completed without generating any patches.",
             agent_thinking_trace="\n\n".join(thinking_trace),
+            iterations_used=len(thinking_trace),
         )
 
     # ── Self-verification for low-confidence patches ──────────────────
@@ -394,6 +418,7 @@ async def run_agentic_fix(
             else ""
         ),
         agent_thinking_trace="\n\n".join(thinking_trace),
+        iterations_used=len(thinking_trace),
     )
 
 
@@ -496,29 +521,43 @@ async def run_auto_fix() -> None:
         "This may take 2–4 minutes..."
     )
 
-    async with LLMClient() as llm:
-        result = await run_agentic_fix(
-            issue=issue_data,
-            repo_path=".",
-            config=config,
-            llm=llm,
-        )
-
-    # Delete the "working" comment
     try:
-        working_comment.delete()
-    except Exception:
-        pass
+        async with LLMClient() as llm:
+            result = await run_agentic_fix(
+                issue=issue_data,
+                repo_path=".",
+                config=config,
+                llm=llm,
+            )
+    finally:
+        # Delete the "working" comment
+        try:
+            working_comment.delete()
+        except Exception:
+            pass
 
     # ── Handle result ────────────────────────────────────────────────
     confidence_threshold = config.get("auto_fix", {}).get("confidence_threshold", 0.70)
 
     if result.gave_up or not result.patches:
+        detailed_reason = result.reason or "Agent could not generate a suitable patch."
         issue.create_comment(
             f"**Ghost Review Auto-Fix**: Unable to generate a patch for this issue.\n\n"
-            f"**Reason**: {result.reason or 'Agent gave up without producing patches.'}\n\n"
-            f"This may mean the fix requires more than 5 files, affects protected paths, "
-            f"or is too ambiguous for automated resolution. Please fix manually."
+            f"**Reason**: {detailed_reason}\n\n"
+            f"**Details**:\n"
+            f"- Iterations used: {result.iterations_used}\n"
+            f"- Files considered: See agent trace below\n\n"
+            f"This may mean:\n"
+            f"- The fix requires more than 5 files\n"
+            f"- The issue affects protected paths (.github/, CI configs)\n"
+            f"- The issue is too ambiguous for automated resolution\n"
+            f"- The code structure is unclear\n\n"
+            f"**Agent Thinking Trace**:\n"
+            f"<details>\n"
+            f"<summary>Click to expand</summary>\n\n"
+            f"{result.agent_thinking_trace or 'No trace available.'}\n"
+            f"</details>\n\n"
+            f"Please fix manually or provide more details in the issue."
         )
         print(f"Auto-fix gave up: {result.reason}")
         return
@@ -544,7 +583,6 @@ async def run_auto_fix() -> None:
 
     # Determine confidence notice
     if avg_confidence < 0.70:
-        # Should not happen (filtered above) but defensive
         notice = "⚠️ **Low confidence patch** — treat with extra caution."
     elif avg_confidence < 0.85:
         notice = "ℹ️ **Medium confidence patch** — self-verification passed."

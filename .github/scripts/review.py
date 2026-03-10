@@ -71,26 +71,27 @@ _MODEL_CONFIG = {
 # Fallback values used when a pass times out or fails
 _FALLBACKS = {
     "summary": {
-        "summary": "[Summary pass unavailable]",
+        "summary": "[Summary pass unavailable — analysis incomplete]",
         "pr_type": "mixed",
-        "risk_assessment": "Unable to assess — summary pass failed.",
+        "risk_assessment": "Unable to assess — summary pass failed or timed out.",
         "changed_files_summary": [],
     },
     "bugs": {"findings": []},
     "security": {"findings": []},
     "synthesis": {
-        "risk_level": "medium",
+        "risk_level": "unknown",
         "merge_recommendation": "needs_discussion",
         "confidence": 0.0,
-        "rationale": "Analysis incomplete — one or more passes failed or timed out.",
+        "rationale": "Analysis incomplete — one or more passes failed or timed out. Please review manually.",
     },
 }
 
+# Extended timeouts for more reliable analysis
 _PASS_TIMEOUTS = {
-    "summary":  90.0,
-    "bugs":     120.0,
-    "security": 90.0,
-    "synthesis": 60.0,
+    "summary":  180.0,  # 3 minutes
+    "bugs":     240.0,  # 4 minutes
+    "security": 180.0,  # 3 minutes
+    "synthesis": 120.0, # 2 minutes
 }
 
 
@@ -132,9 +133,8 @@ async def run_review() -> None:
     # ── Codebase context ─────────────────────────────────────────────
     context = build_codebase_context(changed_files, ".", cfg["context_budget"])
 
-    # ── Track totals for metadata footer ─────────────────────────────
-    total_tokens_in  = 0
-    total_tokens_out = 0
+    # ── Track pass failures ──────────────────────────────────────────
+    failed_passes = []
 
     async with LLMClient() as llm:
         # ── Pass 1: Summary ──────────────────────────────────────────
@@ -153,6 +153,7 @@ async def run_review() -> None:
             timeout_seconds=_PASS_TIMEOUTS["summary"],
         )
         if failed:
+            failed_passes.append("summary")
             warnings.append("⚠️ Summary pass failed or timed out — using fallback.")
 
         # ── Passes 2 + 3: Bugs and Security ─────────────────────────
@@ -184,46 +185,51 @@ async def run_review() -> None:
         else:
             print("[2/4] Bug detection...")
             bugs, bugs_failed = await llm.chat_with_fallback(
-                system=system,
-                user=PROMPT_BUGS.format(context=context, diff=clean_diff),
-                schema=FINDINGS_SCHEMA,
-                fallback_value=_FALLBACKS["bugs"],
-                max_tokens=cfg["max_out_bugs"],
-                temperature=0.1,
+                system=system, user=PROMPT_BUGS.format(context=context, diff=clean_diff),
+                schema=FINDINGS_SCHEMA, fallback_value=_FALLBACKS["bugs"],
+                max_tokens=cfg["max_out_bugs"], temperature=0.1,
                 timeout_seconds=_PASS_TIMEOUTS["bugs"],
             )
             print("[3/4] Security scan...")
             security, security_failed = await llm.chat_with_fallback(
-                system=system,
-                user=PROMPT_SECURITY.format(diff=clean_diff),
-                schema=SECURITY_SCHEMA,
-                fallback_value=_FALLBACKS["security"],
-                max_tokens=cfg["max_out_sec"],
-                temperature=0.1,
+                system=system, user=PROMPT_SECURITY.format(diff=clean_diff),
+                schema=SECURITY_SCHEMA, fallback_value=_FALLBACKS["security"],
+                max_tokens=cfg["max_out_sec"], temperature=0.1,
                 timeout_seconds=_PASS_TIMEOUTS["security"],
             )
 
         if bugs_failed:
+            failed_passes.append("bugs")
             warnings.append("⚠️ Bug detection pass failed or timed out.")
         if security_failed:
+            failed_passes.append("security")
             warnings.append("⚠️ Security scan pass failed or timed out.")
 
         # ── Pass 4: Synthesis ────────────────────────────────────────
         print("[4/4] Synthesis...")
-        synthesis, synth_failed = await llm.chat_with_fallback(
-            system=system,
-            user=PROMPT_SYNTHESIS.format(
-                summary=json.dumps(summary),
-                bugs=json.dumps(bugs),
-                security=json.dumps(security),
-            ),
-            schema=SYNTHESIS_SCHEMA,
-            fallback_value=_FALLBACKS["synthesis"],
-            max_tokens=cfg["max_out_synth"],
-            temperature=0.2,
-            timeout_seconds=_PASS_TIMEOUTS["synthesis"],
-        )
+        
+        # If critical passes failed, force synthesis to use fallback
+        if len(failed_passes) >= 2:
+            print(f"  WARNING: {len(failed_passes)} passes failed, using fallback synthesis.")
+            synthesis = _FALLBACKS["synthesis"]
+            synth_failed = True
+        else:
+            synthesis, synth_failed = await llm.chat_with_fallback(
+                system=system,
+                user=PROMPT_SYNTHESIS.format(
+                    summary=json.dumps(summary),
+                    bugs=json.dumps(bugs),
+                    security=json.dumps(security),
+                ),
+                schema=SYNTHESIS_SCHEMA,
+                fallback_value=_FALLBACKS["synthesis"],
+                max_tokens=cfg["max_out_synth"],
+                temperature=0.2,
+                timeout_seconds=_PASS_TIMEOUTS["synthesis"],
+            )
+        
         if synth_failed:
+            failed_passes.append("synthesis")
             warnings.append("⚠️ Synthesis pass failed or timed out.")
 
     # ── Merge and sort findings ───────────────────────────────────────
@@ -246,6 +252,25 @@ async def run_review() -> None:
 
     all_findings.sort(key=lambda f: SEV_ORDER.get(f.get("severity", "info"), 3))
 
+    # ── Override risk if passes failed ───────────────────────────────
+    # If analysis is incomplete, be conservative
+    if failed_passes:
+        # If synthesis worked but other passes failed, still flag as uncertain
+        if "synthesis" not in failed_passes:
+            # Keep synthesis result but reduce confidence
+            synthesis["confidence"] = min(synthesis.get("confidence", 0.0), 0.3)
+            if synthesis.get("risk_level") == "low":
+                synthesis["risk_level"] = "medium"
+            if synthesis.get("merge_recommendation") == "approve":
+                synthesis["merge_recommendation"] = "needs_discussion"
+        
+        # Add note about failed passes
+        if "rationale" in synthesis:
+            synthesis["rationale"] = (
+                f"⚠️ NOTE: Analysis incomplete ({len(failed_passes)} pass(es) failed). "
+                + synthesis["rationale"]
+            )
+
     # ── Format and post comment ──────────────────────────────────────
     elapsed = time.monotonic() - t_start
     comment = format_review_comment(
@@ -256,8 +281,7 @@ async def run_review() -> None:
         model_size=model_size,
         runner_vcpus=runner_vcpus,
         elapsed_seconds=elapsed,
-        total_tokens_in=total_tokens_in,
-        total_tokens_out=total_tokens_out,
+        failed_passes=failed_passes,
     )
 
     await post_or_update_review_comment(pr, comment)
@@ -270,6 +294,8 @@ async def run_review() -> None:
 
     print(f"\n=== Done in {elapsed_min}m {elapsed_sec}s ===")
     print(f"Risk: {risk} | Recommendation: {rec} | Findings: {len(all_findings)}")
+    if failed_passes:
+        print(f"⚠️ Failed passes: {', '.join(failed_passes)}")
 
     summary_lines = [
         f"## Ghost Review — PR #{pr_number}",
@@ -281,6 +307,8 @@ async def run_review() -> None:
         f"| Time | {elapsed_min}m {elapsed_sec}s |",
         f"| Model | qwen2.5-coder-{model_size} |",
     ]
+    if failed_passes:
+        summary_lines.append(f"| ⚠️ Failed Passes | {len(failed_passes)} |")
     with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as fh:
         fh.write("\n".join(summary_lines) + "\n")
 

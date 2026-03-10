@@ -47,6 +47,7 @@ _RISK_EMOJI = {
     "high":     "🟠 HIGH",
     "medium":   "🟡 MEDIUM",
     "low":      "🟢 LOW",
+    "unknown":  "⚪ UNKNOWN",
 }
 
 _REC_EMOJI = {
@@ -64,12 +65,12 @@ def format_review_comment(
     model_size: str,
     runner_vcpus: str,
     elapsed_seconds: float,
-    total_tokens_in: int,
-    total_tokens_out: int,
+    failed_passes: list[str] | None = None,
 ) -> str:
     """
     Build the full markdown comment posted to the PR.
     """
+    failed_passes = failed_passes or []
     lines: list[str] = [_COMMENT_MARKER]
     lines.append("## 👻 Ghost Review")
     lines.append("")
@@ -78,22 +79,42 @@ def format_review_comment(
     risk = verdict.get("risk_level", "unknown")
     rec = verdict.get("merge_recommendation", "needs_discussion")
     conf = verdict.get("confidence", 0.0)
+    
+    # Adjust display for incomplete analysis
+    if failed_passes:
+        if risk == "low":
+            risk = "medium"  # Be conservative
+        if rec == "approve":
+            rec = "needs_discussion"
+        conf = min(conf, 0.3)  # Reduce confidence
+    
     lines.append(
         f"**Risk**: {_RISK_EMOJI.get(risk, risk.upper())}  "
         f"|  **Recommendation**: {_REC_EMOJI.get(rec, rec)}  "
         f"|  **Confidence**: {conf * 100:.0f}%"
     )
     lines.append("")
+    
+    # Warning banner if analysis incomplete
+    if failed_passes:
+        lines.append("> ⚠️ **Analysis Incomplete**: Some review passes failed or timed out. "
+                     "Results may not be comprehensive. Please review manually.")
+        lines.append("")
+    
     lines.append("---")
     lines.append("")
 
     # Summary
     lines.append("### Summary")
     lines.append("")
-    lines.append(summary.get("summary", "_No summary available._"))
+    summary_text = summary.get("summary", "_No summary available._")
+    if failed_passes and "summary" in failed_passes:
+        summary_text = "_[Summary generation failed — analysis incomplete]_"
+    lines.append(summary_text)
     lines.append("")
+    
     risk_assess = summary.get("risk_assessment", "")
-    if risk_assess:
+    if risk_assess and "summary" not in failed_passes:
         lines.append(f"**Risk assessment**: {risk_assess}")
         lines.append("")
 
@@ -105,7 +126,7 @@ def format_review_comment(
 
     # Changed files table
     changed_files = summary.get("changed_files_summary", [])
-    if changed_files:
+    if changed_files and "summary" not in failed_passes:
         lines.append("### Changed Files")
         lines.append("")
         lines.append("| File | Change | Description |")
@@ -164,7 +185,10 @@ def format_review_comment(
     else:
         lines.append("### Findings")
         lines.append("")
-        lines.append("✅ No significant issues found.")
+        if "bugs" in failed_passes or "security" in failed_passes:
+            lines.append("⚠️ **Findings detection unavailable** — analysis pass(es) failed.")
+        else:
+            lines.append("✅ No significant issues found.")
         lines.append("")
 
     # Warnings (secret redaction, truncation notices)
@@ -175,19 +199,22 @@ def format_review_comment(
             lines.append(f"- {w}")
         lines.append("")
 
-    # Metadata footer
+    # Metadata footer (simplified - no token count)
     elapsed_min = int(elapsed_seconds // 60)
     elapsed_sec = int(elapsed_seconds % 60)
     lines.append("<details>")
     lines.append("<summary>Review metadata</summary>")
     lines.append("")
+    
+    status = "✅ Complete" if not failed_passes else f"⚠️ Incomplete ({len(failed_passes)} pass(es) failed)"
+    
     lines.append(
-        f"Model: `qwen2.5-coder-{model_size}-instruct-q4_k_m`  "
-        f"| Runner: `ubuntu-24.04-arm` {runner_vcpus}-vCPU  "
-        f"| Findings: {len(all_findings)}  "
-        f"| Tokens in/out: {total_tokens_in}/{total_tokens_out}  "
-        f"| Time: {elapsed_min}m {elapsed_sec}s  "
-        f"| Ghost Review"
+        f"Model: `qwen2.5-coder-{model_size}-instruct-q4_k_m`  \n"
+        f"Runner: `ubuntu-24.04-arm` {runner_vcpus}-vCPU  \n"
+        f"Status: {status}  \n"
+        f"Findings: {len(all_findings)}  \n"
+        f"Time: {elapsed_min}m {elapsed_sec}s  \n"
+        f"Ghost Review"
     )
     lines.append("</details>")
 
