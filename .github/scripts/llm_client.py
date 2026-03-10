@@ -193,7 +193,7 @@ class LLMClient:
             endpoint = self._get_next_endpoint()
             
             try:
-                result = await self._circuit_breaker.call(
+                result = await self.circuit_breaker.call(
                     self._do_request, endpoint, payload
                 )
                 self._mark_endpoint_healthy(endpoint, True)
