@@ -5,8 +5,7 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────
-# Install llama-cpp-python with server support
-# This provides llama-server binary via pip wheels (better ARM64 support)
+# Verify llama-cpp-python is installed and find llama-server
 # ──────────────────────────────────────────────────────────────────────
 download_llama_cpp_if_needed() {
     local BINDIR="$HOME/.cache/ghost-review/llama-bin"
@@ -14,30 +13,53 @@ download_llama_cpp_if_needed() {
 
     # Check if we already have it in cache
     if [[ -f "$BINDIR/llama-server" ]]; then
-        echo "llama-server cached: $(${BINDIR}/llama-server --version 2>&1 | head -1 || echo 'version unknown')"
+        echo "llama-server cached"
         return 0
     fi
 
-    echo "Installing llama-cpp-python with server support..."
+    echo "Setting up llama-server..."
     
-    # Install llama-cpp-python with server support
-    # This downloads pre-built wheels when available
-    pip install -q "llama-cpp-python[server]>=0.3.0" --no-cache-dir 2>&1 | tail -5 || {
-        echo "ERROR: Failed to install llama-cpp-python"
-        exit 1
-    }
-
-    # Find the installed llama-server binary
-    local SERVER_BIN
-    SERVER_BIN=$(python3 -c "import llama_cpp.server; print(llama_cpp.server.__file__)" 2>/dev/null | xargs dirname | xargs -I{} dirname)/bin/llama-server || true
+    # Find llama-server from pip installation
+    local SERVER_BIN=""
     
-    if [[ -z "$SERVER_BIN" ]] || [[ ! -f "$SERVER_BIN" ]]; then
-        # Try to find it in PATH
-        SERVER_BIN=$(which llama-server 2>/dev/null || true)
+    # Try to find in PATH first
+    SERVER_BIN=$(which llama-server 2>/dev/null || true)
+    
+    # If not in PATH, try to find via python
+    if [[ -z "$SERVER_BIN" ]]; then
+        SERVER_BIN=$(python3 -c "
+import llama_cpp.server
+import os
+import sys
+# Look for llama-server in the package bin directory
+pkg_dir = os.path.dirname(llama_cpp.server.__file__)
+for root, dirs, files in os.walk(os.path.join(pkg_dir, '..', '..')):
+    if 'llama-server' in files:
+        print(os.path.join(root, 'llama-server'))
+        sys.exit(0)
+" 2>/dev/null || true)
     fi
     
+    # Alternative: try to find with pip show
     if [[ -z "$SERVER_BIN" ]] || [[ ! -f "$SERVER_BIN" ]]; then
-        # Try alternative: python -m llama_cpp.server
+        local PKG_PATH
+        PKG_PATH=$(pip show llama-cpp-python 2>/dev/null | grep "Location:" | cut -d' ' -f2)
+        if [[ -n "$PKG_PATH" ]]; then
+            for candidate in "$PKG_PATH/bin/llama-server" "$PKG_PATH/../bin/llama-server"; do
+                if [[ -f "$candidate" ]]; then
+                    SERVER_BIN="$candidate"
+                    break
+                fi
+            done
+        fi
+    fi
+    
+    if [[ -n "$SERVER_BIN" ]] && [[ -f "$SERVER_BIN" ]]; then
+        cp "$SERVER_BIN" "$BINDIR/llama-server"
+        chmod +x "$BINDIR/llama-server"
+        echo "llama-server installed from: $SERVER_BIN"
+    else
+        # Create a wrapper script that uses python -m
         echo "Creating llama-server wrapper..."
         cat > "$BINDIR/llama-server" << 'EOF'
 #!/usr/bin/env bash
@@ -45,19 +67,17 @@ download_llama_cpp_if_needed() {
 exec python3 -m llama_cpp.server "$@"
 EOF
         chmod +x "$BINDIR/llama-server"
-    else
-        cp "$SERVER_BIN" "$BINDIR/llama-server"
-        chmod +x "$BINDIR/llama-server"
+        echo "llama-server wrapper created"
     fi
 
     # Add to PATH for this session
     export PATH="$BINDIR:$PATH"
     
     # Verify installation
-    if "$BINDIR/llama-server" --version 2>&1 | head -1; then
-        echo "llama-server installed successfully"
+    if "$BINDIR/llama-server" --help &>/dev/null; then
+        echo "llama-server ready"
     else
-        echo "WARNING: llama-server may not work correctly"
+        echo "WARNING: llama-server may have issues, but continuing..."
     fi
 }
 
@@ -67,12 +87,6 @@ EOF
 download_models_if_needed() {
     local DIR="$HOME/.cache/ghost-review/models"
     mkdir -p "$DIR"
-
-    # Install huggingface_hub if needed
-    if ! python3 -c "import huggingface_hub" 2>/dev/null; then
-        echo "Installing huggingface_hub..."
-        pip install -q huggingface_hub hf_transfer
-    fi
 
     # Download 7B model
     if [[ ! -f "$DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" ]]; then

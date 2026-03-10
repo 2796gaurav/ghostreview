@@ -74,6 +74,23 @@ jobs:
           git config user.name  "GhostReview[bot]"
           git config user.email "ghost-review-bot@users.noreply.github.com"
 
+      # ── Cache: Python packages ─────────────────────────────────────
+      - name: Cache Python packages
+        if: steps.perms.outputs.allowed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
+          restore-keys: ghost-review-pip-
+
+      # ── Install Python dependencies FIRST (needed for setup) ───────
+      - name: Install Python dependencies
+        if: steps.perms.outputs.allowed == 'true'
+        run: |
+          pip install -q -r .github/scripts/requirements.txt \
+            --break-system-packages
+
+      # ── Cache: GGUF model files (7B + 3B combined, ~6.9 GB) ────────
       - name: Cache LLM models
         if: steps.perms.outputs.allowed == 'true'
         uses: actions/cache@v4
@@ -83,24 +100,12 @@ jobs:
           restore-keys: |
             ghost-review-models-qwen2.5-coder-
 
-      - name: Cache Python packages
-        if: steps.perms.outputs.allowed == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
-          restore-keys: ghost-review-pip-
-
+      # ── Setup: detect runner + download models + start server ──────
       - name: Setup inference engine
         if: steps.perms.outputs.allowed == 'true'
         run: bash .github/scripts/setup_inference.sh
 
-      - name: Install Python dependencies
-        if: steps.perms.outputs.allowed == 'true'
-        run: |
-          pip install -q -r .github/scripts/requirements.txt \
-            --break-system-packages
-
+      # ── Run auto-fix ───────────────────────────────────────────────
       - name: Run auto-fix
         if: steps.perms.outputs.allowed == 'true'
         env:

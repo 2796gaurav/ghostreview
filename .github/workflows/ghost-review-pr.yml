@@ -42,6 +42,20 @@ jobs:
         with:
           fetch-depth: 0  # full history for accurate diffs
 
+      # ── Cache: Python packages ─────────────────────────────────────
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
+          restore-keys: ghost-review-pip-
+
+      # ── Install Python dependencies FIRST (needed for setup) ───────
+      - name: Install Python dependencies
+        run: |
+          pip install -q -r .github/scripts/requirements.txt \
+            --break-system-packages
+
       # ── Cache: GGUF model files (7B + 3B combined, ~6.9 GB) ────────
       - name: Cache LLM models
         uses: actions/cache@v4
@@ -52,23 +66,9 @@ jobs:
           restore-keys: |
             ghost-review-models-qwen2.5-coder-
 
-      # ── Cache: Python packages ─────────────────────────────────────
-      - name: Cache Python packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
-          restore-keys: ghost-review-pip-
-
-      # ── Setup: install llama.cpp + download models + start server ────
+      # ── Setup: detect runner + download models + start server ──────
       - name: Setup inference engine
         run: bash .github/scripts/setup_inference.sh
-
-      # ── Install Python dependencies ────────────────────────────────
-      - name: Install Python dependencies
-        run: |
-          pip install -q -r .github/scripts/requirements.txt \
-            --break-system-packages
 
       # ── Run the 4-pass PR review ───────────────────────────────────
       - name: Run PR review
