@@ -1,21 +1,15 @@
 """
 .github/scripts/auto_fix.py
 
-Auto-PR Creator — agentic loop triggered by /fix comment or auto-fix label.
+Enhanced Auto-PR Creator with ReAct pattern, validation, and reflection.
+Integrates best practices from autonomous coding agents research.
 
 Architecture:
-  - Grammar-constrained JSON replaces native tool calling
-  - Model outputs action enum + params; orchestrator executes
-  - Self-verification pass for patches below confidence 0.85
-  - All safety gates are hard-coded; none can be configured away
-
-Safety gates (non-negotiable):
-  Gate 1 — Trigger: only write+ permission actors
-  Gate 2 — Protected paths: always enforced
-  Gate 3 — Max 5 files changed
-  Gate 4 — Always draft PR, never auto-merge
-  Gate 5 — Confidence threshold gating
-  Gate 6 — Human-in-the-loop: CODEOWNERS assigned, reasoning visible
+  - ReAct Pattern: Think → Act → Observe → Repeat
+  - Grammar-constrained JSON for reliable structured output
+  - Syntax validation before accepting patches
+  - Self-verification for quality assurance
+  - Hard-coded safety gates
 """
 
 from __future__ import annotations
@@ -40,10 +34,6 @@ from prompts import AGENT_SYSTEM_PROMPT
 from schemas import AGENT_ACTION_SCHEMA, VERIFY_SCHEMA
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Data structures
-# ─────────────────────────────────────────────────────────────────────
-
 @dataclass
 class PatchSpec:
     file_path: str
@@ -63,120 +53,137 @@ class FixResult:
     iterations_used: int = 0
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Protected path checking
-# ─────────────────────────────────────────────────────────────────────
-
-# These paths are ALWAYS protected, regardless of user config.
-_HARDCODED_PROTECTED = [
-    ".github/**",
-    "*.yml",
-    "*.yaml",
-    "Makefile",
-    "makefile",
-    "Dockerfile",
-    "dockerfile",
-    "*.tf",
-    "*.tfvars",
-    "*.tfstate",
-    ".env",
-    ".env.*",
+# Protected paths - cannot be modified by Auto-Fix
+_PROTECTED_PATHS = [
+    ".github/**", "*.yml", "*.yaml", "Makefile", "makefile",
+    "Dockerfile", "dockerfile", "*.tf", "*.tfvars", "*.tfstate",
+    ".env", ".env.*",
 ]
 
-def _is_protected_path(file_path: str, config: dict[str, Any]) -> bool:
-    """Check whether a path is protected (hard-coded + user config)."""
+
+def _is_protected(file_path: str, config: dict) -> bool:
+    """Check if file path is protected."""
     import fnmatch
-
-    all_patterns = list(_HARDCODED_PROTECTED)
-    user_protected = config.get("auto_fix", {}).get("protected_paths", [])
-    all_patterns.extend(user_protected)
-
-    for pattern in all_patterns:
-        if fnmatch.fnmatch(file_path, pattern):
-            return True
-        # Also check path components
-        if fnmatch.fnmatch(Path(file_path).name, pattern.lstrip("*/")):
+    patterns = _PROTECTED_PATHS + config.get("auto_fix", {}).get("protected_paths", [])
+    for pattern in patterns:
+        if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(Path(file_path).name, pattern.lstrip("*/")):
             return True
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────
-# File tree builder
-# ─────────────────────────────────────────────────────────────────────
+def _read_file(repo_path: str, file_path: str, max_chars: int = 8000) -> str:
+    """Read file with error handling."""
+    try:
+        full = Path(repo_path) / file_path.lstrip("/")
+        if not full.exists():
+            return f"ERROR: File not found: {file_path}"
+        content = full.read_text(encoding="utf-8", errors="replace")
+        if len(content) > max_chars:
+            return content[:max_chars] + f"\n... [truncated, total {len(content)} chars]"
+        return content
+    except Exception as e:
+        return f"ERROR reading {file_path}: {e}"
 
-def _build_file_tree(
-    repo_path: str,
-    max_depth: int = 4,
-    max_entries: int = 200,
-) -> str:
-    """
-    Build a condensed file tree for the agent's initial context.
-    Hidden directories (.git, .cache, etc.) and build artifacts are excluded.
-    """
-    SKIP_DIRS = {
-        ".git", ".github", "node_modules", "__pycache__", ".venv", "venv",
-        "dist", "build", ".next", ".gradle", ".cache", "vendor", ".tox",
-        "coverage", ".mypy_cache", ".pytest_cache",
-    }
 
-    lines: list[str] = []
+def _list_dir(repo_path: str, dir_path: str, max_entries: int = 100) -> str:
+    """List directory contents."""
+    try:
+        full = Path(repo_path) / dir_path.lstrip("/")
+        if not full.exists():
+            return f"ERROR: Directory not found: {dir_path}"
+        entries = sorted(
+            [p for p in full.iterdir() if not p.name.startswith(".")],
+            key=lambda p: (p.is_file(), p.name.lower())
+        )
+        lines = []
+        for p in entries[:max_entries]:
+            icon = "📁" if p.is_dir() else "📄"
+            lines.append(f"{icon} {p.name}")
+        if len(entries) > max_entries:
+            lines.append(f"... and {len(entries) - max_entries} more")
+        return f"Contents of {dir_path}:\n" + "\n".join(lines) if lines else f"Directory {dir_path} is empty"
+    except Exception as e:
+        return f"ERROR listing {dir_path}: {e}"
+
+
+def _build_tree(repo_path: str, max_depth: int = 3) -> str:
+    """Build file tree for initial context."""
+    SKIP = {".git", ".github", "node_modules", "__pycache__", ".venv", "venv",
+            "dist", "build", ".next", ".gradle", ".cache", ".tox", ".mypy_cache"}
+    lines = []
     count = 0
-    repo = Path(repo_path)
-
-    def _walk(path: Path, depth: int, prefix: str) -> None:
+    
+    def walk(path: Path, depth: int, prefix: str = ""):
         nonlocal count
-        if depth > max_depth or count >= max_entries:
+        if depth > max_depth or count > 150:
             return
         try:
-            entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
-        except PermissionError:
+            entries = sorted([p for p in path.iterdir() if p.name not in SKIP and not p.name.startswith(".")],
+                           key=lambda p: (p.is_file(), p.name.lower()))
+        except:
             return
-
-        for entry in entries:
-            if count >= max_entries:
-                lines.append(f"{prefix}... (truncated)")
+        for p in entries:
+            if count > 150:
+                lines.append(f"{prefix}...")
                 return
-            if entry.name in SKIP_DIRS or entry.name.startswith("."):
-                continue
-            if entry.is_dir():
-                lines.append(f"{prefix}{entry.name}/")
+            if p.is_dir():
+                lines.append(f"{prefix}{p.name}/")
                 count += 1
-                _walk(entry, depth + 1, prefix + "  ")
+                walk(p, depth + 1, prefix + "  ")
             else:
-                lines.append(f"{prefix}{entry.name}")
+                lines.append(f"{prefix}{p.name}")
                 count += 1
-
-    _walk(repo, 0, "")
+    
+    walk(Path(repo_path), 0)
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Self-verification
-# ─────────────────────────────────────────────────────────────────────
+def _validate_syntax(file_path: str, content: str) -> tuple[bool, str]:
+    """Validate file syntax before accepting patch."""
+    ext = Path(file_path).suffix.lower()
+    
+    if ext == ".py":
+        try:
+            compile(content, file_path, "exec")
+            return True, ""
+        except SyntaxError as e:
+            return False, f"SyntaxError line {e.lineno}: {e.msg}"
+    elif ext in (".js", ".ts", ".jsx", ".tsx"):
+        # Basic checks
+        if content.count("{") != content.count("}"):
+            return False, "Brace mismatch"
+        if content.count("(") != content.count(")"):
+            return False, "Parenthesis mismatch"
+        return True, ""
+    elif ext == ".json":
+        try:
+            json.loads(content)
+            return True, ""
+        except json.JSONDecodeError as e:
+            return False, f"JSON error: {e}"
+    elif ext in (".yml", ".yaml"):
+        try:
+            import yaml
+            yaml.safe_load(content)
+            return True, ""
+        except Exception as e:
+            return False, f"YAML error: {e}"
+    return True, ""
 
-async def _verify_patch(
-    patch: PatchSpec,
-    issue_body: str,
-    llm: LLMClient,
-) -> PatchSpec:
-    """
-    Run an independent second-pass verification for patches below
-    confidence 0.85. Combines agent confidence with verifier confidence.
-    """
+
+async def _verify_patch(patch: PatchSpec, issue_body: str, llm: LLMClient) -> PatchSpec:
+    """Verify patch correctness."""
     try:
         result = await asyncio.wait_for(
             llm.chat(
-                system=(
-                    "You are a careful code reviewer. Assess whether a proposed "
-                    "patch correctly and safely fixes the described issue."
-                ),
+                system="You are a code reviewer. Assess if a patch correctly fixes an issue.",
                 user=(
-                    f"Issue description:\n{sanitize(issue_body, 800)}\n\n"
+                    f"Issue: {sanitize(issue_body, 800)}\n\n"
                     f"File: {patch.file_path}\n"
                     f"Explanation: {patch.explanation}\n\n"
-                    f"First 60 lines of patched file:\n"
-                    + "\n".join(patch.patched_content.splitlines()[:60])
-                    + "\n\nDoes this patch correctly and safely fix the issue?"
+                    f"Patched content (first 50 lines):\n"
+                    + "\n".join(patch.patched_content.splitlines()[:50])
+                    + "\n\nDoes this patch correctly fix the issue?"
                 ),
                 schema=VERIFY_SCHEMA,
                 max_tokens=256,
@@ -185,436 +192,275 @@ async def _verify_patch(
             timeout=60.0,
         )
         if result["correct"]:
-            patch.final_confidence = (
-                patch.patch_confidence + result["verified_confidence"]
-            ) / 2
+            patch.final_confidence = (patch.patch_confidence + result["verified_confidence"]) / 2
         else:
             patch.final_confidence = patch.patch_confidence * 0.4
             patch.verification_concern = result["concern"]
-        print(
-            f"  Verification: correct={result['correct']} "
-            f"final_confidence={patch.final_confidence:.2f} "
-            f"concern={result['concern'][:100]}"
-        )
-    except (LLMError, asyncio.TimeoutError) as exc:
-        print(f"  Verification failed: {exc}. Using original confidence.")
+    except Exception as exc:
+        print(f"  Verification warning: {exc}")
         patch.final_confidence = patch.patch_confidence
     return patch
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Agentic loop
-# ─────────────────────────────────────────────────────────────────────
-
-async def run_agentic_fix(
-    issue: dict[str, Any],
-    repo_path: str,
-    config: dict[str, Any],
-    llm: LLMClient,
-) -> FixResult:
+async def run_agentic_fix(issue: dict, repo_path: str, config: dict, llm: LLMClient) -> FixResult:
     """
-    Grammar-constrained agentic loop.
-
-    The model outputs a JSON object with:
-      - thinking: step-by-step reasoning
-      - action: one of read_file | list_directory | generate_patch | finish | give_up
-      - action_params: action-specific dict
-      - confidence: float 0-1
-
-    The orchestrator executes the action and feeds the result back.
-    Max 12 iterations (configurable higher only for more file reads, never fewer).
+    ReAct-based agentic loop.
     """
-    MAX_ITERATIONS = 12
+    MAX_ITER = 15
     CONFIDENCE_THRESHOLD = config.get("auto_fix", {}).get("confidence_threshold", 0.70)
-    MAX_FILES = min(config.get("auto_fix", {}).get("max_files", 5), 5)  # hard cap 5
-
-    file_tree = _build_file_tree(repo_path)
+    MAX_FILES = min(config.get("auto_fix", {}).get("max_files", 5), 5)
+    
+    file_tree = _build_tree(repo_path)
     patches: list[PatchSpec] = []
     thinking_trace: list[str] = []
-    conversation: list[dict[str, str]] = []
+    conversation: list[dict] = []
     files_read: set[str] = set()
+    
+    initial = f"""Fix this GitHub issue. Work step by step.
 
-    initial_message = (
-        f"Issue #{issue['number']}: {issue['title']}\n\n"
-        f"Description:\n{sanitize(issue.get('body') or '', max_chars=3000)}\n\n"
-        f"Repository structure:\n{file_tree}\n\n"
-        "Begin by identifying which files are relevant to this issue. "
-        "Use list_directory to explore, then read_file to understand the code, "
-        "then generate_patch to create fixes."
-    )
-    conversation.append({"role": "user", "content": initial_message})
+ISSUE #{issue['number']}: {issue['title']}
 
-    for iteration in range(MAX_ITERATIONS):
-        print(f"  Agent iteration {iteration + 1}/{MAX_ITERATIONS}...")
+DESCRIPTION:
+{sanitize(issue.get('body') or '', max_chars=3000)}
 
-        # Build conversation prompt
-        user_content = "\n\n".join(
-            f"[{msg['role'].upper()}]\n{msg['content']}"
-            for msg in conversation
-        )
+REPOSITORY:
+{file_tree}
 
+INSTRUCTIONS:
+1. Explore structure with list_directory
+2. Read relevant files with read_file
+3. Generate complete patches with generate_patch
+4. Patches must be FULL file content, not diffs
+5. You MUST read a file before patching it
+
+Start exploring."""
+
+    conversation.append({"role": "user", "content": initial})
+    
+    for iteration in range(MAX_ITER):
+        print(f"  Iteration {iteration + 1}/{MAX_ITER}")
+        
+        user_content = "\n\n".join(f"[{m['role'].upper()}]\n{m['content'][:4000]}" for m in conversation[-8:])
+        
         try:
             result = await asyncio.wait_for(
                 llm.chat(
                     system=AGENT_SYSTEM_PROMPT,
                     user=user_content,
                     schema=AGENT_ACTION_SCHEMA,
-                    max_tokens=2048,
+                    max_tokens=3000,
                     temperature=0.2,
                 ),
-                timeout=120.0,
+                timeout=180.0,
             )
-        except (LLMError, asyncio.TimeoutError) as exc:
-            print(f"  Agent call failed on iteration {iteration+1}: {exc}")
-            return FixResult(
-                gave_up=True,
-                reason=f"LLM error on iteration {iteration+1}: {exc}",
-                agent_thinking_trace="\n\n".join(thinking_trace),
-                iterations_used=iteration + 1,
-            )
-
+        except asyncio.TimeoutError:
+            print(f"  Timeout on iteration {iteration+1}")
+            if patches:
+                break
+            return FixResult(gave_up=True, reason="Timeout", iterations_used=iteration+1)
+        except LLMError as exc:
+            print(f"  LLM Error: {exc}")
+            if patches:
+                break
+            return FixResult(gave_up=True, reason=f"LLM error: {exc}", iterations_used=iteration+1)
+        
         action = result.get("action", "give_up")
-        params = result.get("action_params") or {}
+        params = result.get("action_params", {})
         thinking = result.get("thinking", "")
-        confidence = float(result.get("confidence") or 0.5)
-
+        
         if thinking:
             thinking_trace.append(f"[Step {iteration+1}] {thinking}")
-
-        conversation.append({
-            "role": "assistant",
-            "content": json.dumps(result),
-        })
-
-        # ── Execute action ────────────────────────────────────────────
+        
+        conversation.append({"role": "assistant", "content": json.dumps(result)})
+        
+        # Execute action
         if action == "read_file":
-            file_path = params.get("path", "").lstrip("/")
-            full_path = Path(repo_path) / file_path
-            if full_path.exists() and full_path.is_file():
-                content = full_path.read_text(encoding="utf-8", errors="replace")[:8000]
-                action_result = f"Contents of {file_path}:\n\n{content}"
-                if len(content) >= 8000:
-                    action_result += "\n\n[File truncated at 8000 chars]"
-                files_read.add(file_path)
-            else:
-                action_result = f"ERROR: File not found: {file_path}"
-
+            path = params.get("path", "").lstrip("/")
+            content = _read_file(repo_path, path)
+            files_read.add(path)
+            action_result = f"Contents of {path}:\n```\n{content}\n```"
+            
         elif action == "list_directory":
-            dir_path = params.get("path", ".").lstrip("/")
-            full_path = Path(repo_path) / dir_path
-            if full_path.exists() and full_path.is_dir():
-                entries = sorted(
-                    str(p.relative_to(full_path))
-                    for p in full_path.iterdir()
-                    if not p.name.startswith(".")
-                )
-                action_result = (
-                    f"Contents of {dir_path}/:\n"
-                    + "\n".join(entries[:100])
-                )
-                if len(entries) > 100:
-                    action_result += f"\n... and {len(entries) - 100} more"
-            else:
-                action_result = f"ERROR: Directory not found: {dir_path}"
-
+            path = params.get("path", ".").lstrip("/")
+            action_result = _list_dir(repo_path, path)
+            
         elif action == "generate_patch":
             fp = params.get("file_path", "").lstrip("/")
             patched = params.get("patched_content", "")
             explanation = params.get("explanation", "")
-            patch_confidence = float(params.get("confidence") or confidence)
-
+            confidence = float(params.get("confidence") or 0.5)
+            
+            errors = []
             if not fp:
-                action_result = "ERROR: file_path is required for generate_patch"
-            elif _is_protected_path(fp, config):
-                action_result = f"ERROR: {fp} is a protected path and cannot be modified"
+                errors.append("file_path required")
+            elif _is_protected(fp, config):
+                errors.append(f"{fp} is protected")
             elif len(patches) >= MAX_FILES:
-                action_result = f"ERROR: Maximum of {MAX_FILES} files already staged"
+                errors.append(f"Max {MAX_FILES} files")
             elif not patched:
-                action_result = "ERROR: patched_content is required"
+                errors.append("patched_content required")
             elif fp not in files_read:
-                action_result = f"ERROR: You must read {fp} before patching it"
+                errors.append(f"Must read {fp} first")
+            
+            if errors:
+                action_result = "ERROR:\n" + "\n".join(f"- {e}" for e in errors)
             else:
-                patch = PatchSpec(
-                    file_path=fp,
-                    patched_content=patched,
-                    explanation=explanation,
-                    patch_confidence=patch_confidence,
-                    final_confidence=patch_confidence,
-                )
-                patches.append(patch)
-                action_result = f"Patch staged for {fp} (confidence={patch_confidence:.2f})"
-
+                valid, error = _validate_syntax(fp, patched)
+                if not valid:
+                    action_result = f"ERROR: Validation failed: {error}\nRegenerate with correct syntax."
+                else:
+                    patch = PatchSpec(
+                        file_path=fp,
+                        patched_content=patched,
+                        explanation=explanation,
+                        patch_confidence=confidence,
+                        final_confidence=confidence,
+                    )
+                    patches.append(patch)
+                    action_result = f"✅ Patch staged for {fp} (confidence={confidence:.2f})"
+                    print(f"    {action_result}")
+        
         elif action == "finish":
-            print(f"  Agent finished after {iteration + 1} iterations.")
+            print(f"  Finished after {iteration + 1} iterations")
             break
-
+            
         elif action == "give_up":
-            explanation = params.get("explanation", "No explanation provided.")
-            print(f"  Agent gave up: {explanation}")
-            return FixResult(
-                gave_up=True,
-                reason=explanation,
-                agent_thinking_trace="\n\n".join(thinking_trace),
-                iterations_used=iteration + 1,
-            )
-
+            reason = params.get("explanation", "Gave up without explanation")
+            print(f"  Gave up: {reason}")
+            return FixResult(gave_up=True, reason=reason, agent_thinking_trace="\n".join(thinking_trace), iterations_used=iteration+1)
+        
         else:
             action_result = f"ERROR: Unknown action '{action}'"
-
-        conversation.append({
-            "role": "user",
-            "content": f"Result:\n{action_result}\n\nContinue.",
-        })
-
+        
+        conversation.append({"role": "user", "content": f"[RESULT]\n{action_result}\n\nContinue."})
+    
     else:
-        # Max iterations reached without finish
         if not patches:
-            return FixResult(
-                gave_up=True,
-                reason=f"Max iterations ({MAX_ITERATIONS}) reached without generating any patches.",
-                agent_thinking_trace="\n\n".join(thinking_trace),
-                iterations_used=MAX_ITERATIONS,
-            )
-
+            return FixResult(gave_up=True, reason=f"Max iterations ({MAX_ITER}) reached", iterations_used=MAX_ITER)
+    
     if not patches:
-        return FixResult(
-            gave_up=True,
-            reason="Agent completed without generating any patches.",
-            agent_thinking_trace="\n\n".join(thinking_trace),
-            iterations_used=len(thinking_trace),
-        )
-
-    # ── Self-verification for low-confidence patches ──────────────────
+        return FixResult(gave_up=True, reason="No patches generated", iterations_used=len(thinking_trace))
+    
+    # Verify low-confidence patches
+    print("  Verifying patches...")
     issue_body = issue.get("body") or ""
-    verified_patches: list[PatchSpec] = []
-
+    verified = []
     for patch in patches:
         if patch.patch_confidence < 0.85:
-            print(f"  Verifying patch for {patch.file_path} (confidence={patch.patch_confidence:.2f})")
             patch = await _verify_patch(patch, issue_body, llm)
-        verified_patches.append(patch)
-
-    # Filter out patches where verification found a serious problem
-    final_patches = [
-        p for p in verified_patches
-        if p.final_confidence >= CONFIDENCE_THRESHOLD
-    ]
-
-    rejected = [p for p in verified_patches if p.final_confidence < CONFIDENCE_THRESHOLD]
+        verified.append(patch)
+    
+    final_patches = [p for p in verified if p.final_confidence >= CONFIDENCE_THRESHOLD]
+    rejected = [p for p in verified if p.final_confidence < CONFIDENCE_THRESHOLD]
+    
     if rejected:
         for p in rejected:
-            print(
-                f"  Rejected patch for {p.file_path}: "
-                f"final_confidence={p.final_confidence:.2f} "
-                f"concern={p.verification_concern[:80]}"
-            )
-
+            print(f"  Rejected {p.file_path}: confidence={p.final_confidence:.2f}")
+    
     return FixResult(
         patches=final_patches,
         gave_up=len(final_patches) == 0,
-        reason=(
-            f"{len(rejected)} patch(es) rejected by verification."
-            if rejected and not final_patches
-            else ""
-        ),
-        agent_thinking_trace="\n\n".join(thinking_trace),
+        reason=f"{len(rejected)} rejected" if rejected and not final_patches else "",
+        agent_thinking_trace="\n".join(thinking_trace),
         iterations_used=len(thinking_trace),
     )
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Branch and commit helpers
-# ─────────────────────────────────────────────────────────────────────
-
-def _apply_patches_to_branch(
-    patches: list[PatchSpec],
-    branch_name: str,
-    issue_number: int,
-    issue_title: str,
-    base_branch: str,
-) -> None:
-    """
-    Create a git branch, write patched file contents, and commit.
-    Runs in the checked-out repository root.
-    """
-    def _run(cmd: list[str]) -> None:
+def _apply_patches(patches: list, branch_name: str, issue_num: int, issue_title: str, base: str) -> None:
+    """Create branch and commit patches."""
+    def run(cmd: list):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(
-                f"Git command failed: {' '.join(cmd)}\n"
-                f"stderr: {result.stderr[:500]}"
-            )
-
-    # Create branch from current HEAD
-    _run(["git", "checkout", "-b", branch_name])
-
-    # Write each patched file
+            raise RuntimeError(f"Git failed: {' '.join(cmd)}\n{result.stderr[:500]}")
+    
+    run(["git", "checkout", "-b", branch_name])
+    
     for patch in patches:
         path = Path(patch.file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(patch.patched_content, encoding="utf-8")
-        _run(["git", "add", patch.file_path])
+        run(["git", "add", patch.file_path])
         print(f"  Staged: {patch.file_path}")
+    
+    msg = f"fix: {issue_title[:60]} (AI-generated)\n\nCloses #{issue_num}\n\nGenerated by Ghost Review."
+    run(["git", "commit", "-m", msg])
+    run(["git", "push", "origin", branch_name])
+    print(f"  Pushed: {branch_name}")
 
-    # Commit
-    commit_message = (
-        f"fix: {issue_title[:60]} (AI-generated)\n\n"
-        f"Closes #{issue_number}\n\n"
-        f"Generated by Ghost Review. Requires human review before merging."
-    )
-    _run(["git", "commit", "-m", commit_message])
-
-    # Push branch
-    _run(["git", "push", "origin", branch_name])
-    print(f"  Pushed branch: {branch_name}")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Main entrypoint
-# ─────────────────────────────────────────────────────────────────────
 
 async def run_auto_fix() -> None:
-    github_token  = os.environ["GITHUB_TOKEN"]
-    repo_slug     = os.environ["REPO"]
-    issue_number  = int(os.environ["ISSUE_NUMBER"])
-    actor         = os.environ.get("ACTOR", "")
-    model_size    = os.environ.get("MODEL_SIZE", "7b")
-
-    g      = Github(github_token)
-    repo   = g.get_repo(repo_slug)
-    issue  = repo.get_issue(issue_number)
+    github_token = os.environ["GITHUB_TOKEN"]
+    repo_slug = os.environ["REPO"]
+    issue_number = int(os.environ["ISSUE_NUMBER"])
+    actor = os.environ.get("ACTOR", "")
+    model_size = os.environ.get("MODEL_SIZE", "7b")
+    
+    g = Github(github_token)
+    repo = g.get_repo(repo_slug)
+    issue = repo.get_issue(issue_number)
     config = load_config(".github/localreviewer.yml")
-
+    
     print(f"=== Ghost Review Auto-Fix | Issue #{issue_number} | model={model_size} ===")
-
-    # ── Gate 1: 3B restriction ───────────────────────────────────────
+    
     if model_size == "3b":
-        issue.create_comment(
-            "**Ghost Review Auto-Fix**: The 3B fallback model is active on "
-            "this runner. Patch generation requires the 7B model for adequate "
-            "reliability. Set `MODEL_SIZE_OVERRIDE: '7b'` in the workflow env "
-            "if this runner has ≥6 GB free after OS overhead."
-        )
-        print("Aborting: 3B model is not suitable for auto-fix.")
+        issue.create_comment("⚠️ Auto-Fix requires 7B model. 3B is insufficient.")
+        print("Abort: 3B model")
         return
-
-    # ── Gate 2: Permission check ─────────────────────────────────────
+    
     if actor and not check_actor_permission(repo, actor, required="write"):
-        print(f"Skipping: actor '{actor}' lacks write permission.")
+        print(f"Skip: {actor} lacks permission")
         return
-
-    # ── Gate 3: Auto-fix enabled? ────────────────────────────────────
+    
     if not config.get("auto_fix", {}).get("enabled", True):
-        print("Auto-fix is disabled in localreviewer.yml.")
+        print("Skip: Disabled")
         return
-
-    # ── Run agentic loop ─────────────────────────────────────────────
-    issue_data = {
-        "number": issue_number,
-        "title":  issue.title,
-        "body":   issue.body or "",
-    }
-
-    # Post a "working on it" comment
-    working_comment = issue.create_comment(
-        "🤖 **Ghost Review** is analyzing this issue and generating a fix patch. "
-        "This may take 2–4 minutes..."
-    )
-
+    
+    issue_data = {"number": issue_number, "title": issue.title, "body": issue.body or ""}
+    
+    working = issue.create_comment("🤖 Auto-Fix analyzing... (3-5 minutes)")
+    
     try:
         async with LLMClient() as llm:
-            result = await run_agentic_fix(
-                issue=issue_data,
-                repo_path=".",
-                config=config,
-                llm=llm,
-            )
+            result = await run_agentic_fix(issue_data, ".", config, llm)
     finally:
-        # Delete the "working" comment
         try:
-            working_comment.delete()
-        except Exception:
+            working.delete()
+        except:
             pass
-
-    # ── Handle result ────────────────────────────────────────────────
-    confidence_threshold = config.get("auto_fix", {}).get("confidence_threshold", 0.70)
-
+    
     if result.gave_up or not result.patches:
-        detailed_reason = result.reason or "Agent could not generate a suitable patch."
         issue.create_comment(
-            f"**Ghost Review Auto-Fix**: Unable to generate a patch for this issue.\n\n"
-            f"**Reason**: {detailed_reason}\n\n"
-            f"**Details**:\n"
-            f"- Iterations used: {result.iterations_used}\n"
-            f"- Files considered: See agent trace below\n\n"
-            f"This may mean:\n"
-            f"- The fix requires more than 5 files\n"
-            f"- The issue affects protected paths (.github/, CI configs)\n"
-            f"- The issue is too ambiguous for automated resolution\n"
-            f"- The code structure is unclear\n\n"
-            f"**Agent Thinking Trace**:\n"
-            f"<details>\n"
-            f"<summary>Click to expand</summary>\n\n"
-            f"{result.agent_thinking_trace or 'No trace available.'}\n"
-            f"</details>\n\n"
-            f"Please fix manually or provide more details in the issue."
+            f"❌ Auto-Fix failed\n\n**Reason**: {result.reason or 'Unable to generate patch'}\n\n"
+            f"**Trace**:\n<details><summary>Click to expand</summary>\n\n{result.agent_thinking_trace}\n</details>\n\n"
+            "Please fix manually."
         )
-        print(f"Auto-fix gave up: {result.reason}")
+        print(f"Failed: {result.reason}")
         return
-
-    # ── Apply patches and create PR ──────────────────────────────────
-    branch_name = f"fix/ai-{issue_number}-{issue.title[:20].lower().replace(' ', '-').strip('-')}"
-    # Sanitize branch name
-    import re
-    branch_name = re.sub(r"[^a-z0-9\-/]", "-", branch_name)[:80]
-
-    base_branch = repo.default_branch
-
-    _apply_patches_to_branch(
-        patches=result.patches,
-        branch_name=branch_name,
-        issue_number=issue_number,
-        issue_title=issue.title,
-        base_branch=base_branch,
-    )
-
-    # Calculate aggregate confidence
-    avg_confidence = sum(p.final_confidence for p in result.patches) / len(result.patches)
-
-    # Determine confidence notice
-    if avg_confidence < 0.70:
-        notice = "⚠️ **Low confidence patch** — treat with extra caution."
-    elif avg_confidence < 0.85:
-        notice = "ℹ️ **Medium confidence patch** — self-verification passed."
-    else:
-        notice = "✅ **High confidence patch**."
-
-    patch_summaries = [
-        {"file_path": p.file_path, "explanation": p.explanation}
-        for p in result.patches
-    ]
-
+    
+    safe_title = "".join(c if c.isalnum() or c in "-_" else "-" for c in issue.title[:30])
+    branch_name = f"fix/ai-{issue_number}-{safe_title}"
+    
+    _apply_patches(result.patches, branch_name, issue_number, issue.title, repo.default_branch)
+    
+    avg_conf = sum(p.final_confidence for p in result.patches) / len(result.patches)
+    notice = "✅ High confidence" if avg_conf >= 0.85 else "ℹ️ Medium confidence" if avg_conf >= 0.70 else "⚠️ Low confidence"
+    
+    patch_summaries = [{"file_path": p.file_path, "explanation": p.explanation} for p in result.patches]
+    
     pr_url = create_draft_pr(
-        repo=repo,
-        branch_name=branch_name,
-        base_branch=base_branch,
-        issue_number=issue_number,
-        issue_title=issue.title,
-        patch_summaries=patch_summaries,
-        agent_thinking=result.agent_thinking_trace,
-        confidence=avg_confidence,
-        repo_path=".",
+        repo=repo, branch_name=branch_name, base_branch=repo.default_branch,
+        issue_number=issue_number, issue_title=issue.title,
+        patch_summaries=patch_summaries, agent_thinking=result.agent_thinking_trace,
+        confidence=avg_conf, repo_path=".",
     )
-
-    # Comment on issue with PR link
+    
     issue.create_comment(
-        f"**Ghost Review Auto-Fix** created a draft PR: {pr_url}\n\n"
-        f"{notice}\n\n"
-        f"Files modified: {', '.join(f'`{p.file_path}`' for p in result.patches)}\n\n"
-        f"⚠️ This PR was generated by AI. Please review carefully before merging."
+        f"✅ Draft PR: {pr_url}\n\n{notice} ({avg_conf*100:.0f}%)\n\n"
+        f"**Files**:\n" + "\n".join(f"- `{p.file_path}`" for p in result.patches)
+        + "\n\n⚠️ Review carefully before merging."
     )
-
-    print(f"✅ Auto-fix complete. Draft PR: {pr_url}")
+    
+    print(f"✅ Success: {pr_url}")
 
 
 if __name__ == "__main__":

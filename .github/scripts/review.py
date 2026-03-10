@@ -1,15 +1,8 @@
 """
 .github/scripts/review.py
 
-PR Review orchestrator — runs 4 passes against the diff:
-  Pass 1: Summary (temperature=0.3)
-  Pass 2: Bug/logic detection (temperature=0.1)
-  Pass 3: Security scan (temperature=0.1)
-  Pass 4: Synthesis/verdict (temperature=0.2)
-
-Passes 2 and 3 run concurrently on 4-vCPU runners (--parallel 2).
-All passes use grammar-constrained JSON (enforced at token sampler).
-KV prefix cache reuse is activated via cache_prompt=True in each request.
+Main PR review orchestrator with 4-pass analysis.
+Implements: Summary → Bug + Security (parallel) → Synthesis → Comments
 """
 
 from __future__ import annotations
@@ -17,301 +10,340 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
-import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-# Ensure script directory is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config
-from context_builder import build_codebase_context
-from diff_parser import (
-    extract_changed_files,
-    get_diff,
-    preprocess_diff,
-    sanitize,
-)
+from diff_parser import parse_diff, sanitize
 from github import Github
-from github_api import format_review_comment, post_or_update_review_comment
 from llm_client import LLMClient, LLMError
-from prompts import (
-    PROMPT_BUGS,
-    PROMPT_SECURITY,
-    PROMPT_SUMMARY,
-    PROMPT_SYNTHESIS,
-    build_system_prompt,
-)
-from schemas import FINDINGS_SCHEMA, SECURITY_SCHEMA, SUMMARY_SCHEMA, SYNTHESIS_SCHEMA
+from prompts import build_system_prompt, PROMPT_SUMMARY, PROMPT_BUGS, PROMPT_SECURITY, PROMPT_SYNTHESIS
+from schemas import SUMMARY_SCHEMA, BUGS_SCHEMA, SECURITY_SCHEMA, SYNTHESIS_SCHEMA
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Per-model configuration
-# ─────────────────────────────────────────────────────────────────────
-
+# Model-specific token budgets
 _MODEL_CONFIG = {
-    "7b": {
-        "diff_budget":    22_000,
-        "context_budget": 5_000,
-        "max_out_bugs":   2_048,
-        "max_out_sec":    1_024,
-        "max_out_synth":  512,
-        "max_out_summ":   512,
-    },
-    "3b": {
-        "diff_budget":    8_000,
-        "context_budget": 2_500,
-        "max_out_bugs":   1_024,
-        "max_out_sec":    512,
-        "max_out_synth":  512,
-        "max_out_summ":   512,
-    },
+    "7b": {"max_diff_tokens": 22000, "context_reserve": 5000},
+    "3b": {"max_diff_tokens": 8000, "context_reserve": 2500},
 }
 
-# Fallback values used when a pass times out or fails
+# Pass timeouts (seconds)
+_PASS_TIMEOUTS = {
+    "summary": 180.0,
+    "bugs": 240.0,
+    "security": 180.0,
+    "synthesis": 120.0,
+}
+
+# Fallback values when passes fail/time out
 _FALLBACKS = {
-    "summary": {
-        "summary": "[Summary pass unavailable — analysis incomplete]",
-        "pr_type": "mixed",
-        "risk_assessment": "Unable to assess — summary pass failed or timed out.",
-        "changed_files_summary": [],
-    },
+    "summary": {"pr_type": "unknown", "pr_description": "Unable to analyze", "affected_components": [], "risk_areas": []},
     "bugs": {"findings": []},
     "security": {"findings": []},
-    "synthesis": {
-        "risk_level": "unknown",
-        "merge_recommendation": "needs_discussion",
-        "confidence": 0.0,
-        "rationale": "Analysis incomplete — one or more passes failed or timed out. Please review manually.",
-    },
+    "synthesis": {"risk_level": "unknown", "confidence": 0.0, "summary": "Analysis unavailable", "recommendation": "Please review manually"},
 }
 
-# Extended timeouts for more reliable analysis
-_PASS_TIMEOUTS = {
-    "summary":  180.0,  # 3 minutes
-    "bugs":     240.0,  # 4 minutes
-    "security": 180.0,  # 3 minutes
-    "synthesis": 120.0, # 2 minutes
-}
+SEV_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3, "unknown": 4}
 
 
-async def run_review() -> None:
-    # ── Environment ──────────────────────────────────────────────────
-    github_token = os.environ["GITHUB_TOKEN"]
-    repo_slug    = os.environ["REPO"]
-    pr_number    = int(os.environ["PR_NUMBER"])
-    base_sha     = os.environ["BASE_SHA"]
-    head_sha     = os.environ["HEAD_SHA"]
-    model_size   = os.environ.get("MODEL_SIZE", "3b")
-    runner_vcpus = os.environ.get("RUNNER_VCPUS", "2")
+@dataclass
+class ReviewResult:
+    risk_level: str = "unknown"
+    confidence: float = 0.0
+    summary: str = ""
+    pr_type: str = "unknown"
+    bugs: list = field(default_factory=list)
+    security: list = field(default_factory=list)
+    failed_passes: list = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
-    cfg = _MODEL_CONFIG.get(model_size, _MODEL_CONFIG["3b"])
 
-    t_start = time.monotonic()
+def _get_token_budget(model_size: str) -> tuple[int, int]:
+    cfg = _MODEL_CONFIG.get(model_size, _MODEL_CONFIG["7b"])
+    return cfg["max_diff_tokens"], cfg["context_reserve"]
 
-    # ── GitHub objects ───────────────────────────────────────────────
-    g       = Github(github_token)
-    repo    = g.get_repo(repo_slug)
-    pr      = repo.get_pull(pr_number)
-    config  = load_config(".github/localreviewer.yml")
-    system  = build_system_prompt(config)
 
-    print(f"=== Ghost Review | PR #{pr_number} | model=qwen2.5-coder-{model_size} ===")
+def _cap_diff(diff: str, model_size: str) -> str:
+    max_tokens, _ = _get_token_budget(model_size)
+    # Estimate 4 chars per token
+    max_chars = max_tokens * 4
+    if len(diff) <= max_chars:
+        return diff
+    return diff[:max_chars] + f"\n\n... [truncated {len(diff) - max_chars} chars]"
 
-    # ── Diff preprocessing ───────────────────────────────────────────
-    raw_diff             = get_diff(base_sha, head_sha)
-    clean_diff, warnings = preprocess_diff(raw_diff, cfg["diff_budget"], config)
 
-    if not clean_diff.strip():
-        print("No reviewable diff after filtering. Skipping.")
-        return
-
-    changed_files = extract_changed_files(raw_diff)
-    print(f"Changed files (after filter): {len(changed_files)}")
-    print(f"Diff size: ~{len(clean_diff)//3} tokens")
-
-    # ── Codebase context ─────────────────────────────────────────────
-    context = build_codebase_context(changed_files, ".", cfg["context_budget"])
-
-    # ── Track pass failures ──────────────────────────────────────────
-    failed_passes = []
-
-    async with LLMClient() as llm:
-        # ── Pass 1: Summary ──────────────────────────────────────────
-        print("[1/4] Summary pass...")
-        summary, failed = await llm.chat_with_fallback(
-            system=system,
-            user=PROMPT_SUMMARY.format(
-                title=pr.title,
-                body=sanitize(pr.body or "", max_chars=1500),
-                diff=clean_diff[:8000],
+async def run_review(pr_data: dict, diff_text: str, model_size: str, llm: LLMClient) -> ReviewResult:
+    """
+    4-pass review with parallel bug + security passes.
+    """
+    result = ReviewResult()
+    diff_capped = _cap_diff(diff_text, model_size)
+    system = build_system_prompt(pr_data.get("config", {}))
+    
+    print(f"Starting review: model={model_size}, diff_chars={len(diff_text)}, capped={len(diff_capped)}")
+    
+    # Pass 1: Summary
+    print("Pass 1/4: Summary...")
+    try:
+        summary = await asyncio.wait_for(
+            llm.chat(
+                system=system,
+                user=PROMPT_SUMMARY.format(title=pr_data.get("title", ""), body=pr_data.get("body", "")[:3000], diff=diff_capped[:4000]),
+                schema=SUMMARY_SCHEMA,
+                max_tokens=2048,
+                temperature=0.2,
             ),
-            schema=SUMMARY_SCHEMA,
-            fallback_value=_FALLBACKS["summary"],
-            max_tokens=cfg["max_out_summ"],
-            temperature=0.3,
-            timeout_seconds=_PASS_TIMEOUTS["summary"],
+            timeout=_PASS_TIMEOUTS["summary"],
         )
-        if failed:
-            failed_passes.append("summary")
-            warnings.append("⚠️ Summary pass failed or timed out — using fallback.")
-
-        # ── Passes 2 + 3: Bugs and Security ─────────────────────────
-        use_parallel = int(runner_vcpus) >= 4
-
-        if use_parallel:
-            print("[2+3/4] Bug detection + security scan (parallel)...")
-            bugs_task = llm.chat_with_fallback(
-                system=system,
-                user=PROMPT_BUGS.format(context=context, diff=clean_diff),
-                schema=FINDINGS_SCHEMA,
-                fallback_value=_FALLBACKS["bugs"],
-                max_tokens=cfg["max_out_bugs"],
-                temperature=0.1,
-                timeout_seconds=_PASS_TIMEOUTS["bugs"],
+        result.pr_type = summary.get("pr_type", "unknown")
+        result.summary = summary.get("pr_description", "")
+        result.metadata["affected_components"] = summary.get("affected_components", [])
+        result.metadata["risk_areas"] = summary.get("risk_areas", [])
+    except (asyncio.TimeoutError, LLMError) as e:
+        print(f"  Summary failed: {e}")
+        result.failed_passes.append("summary")
+        summary = _FALLBACKS["summary"]
+        result.pr_type = summary["pr_type"]
+        result.summary = summary["pr_description"]
+    
+    # Pass 2+3: Bug detection + Security (parallel)
+    use_parallel = True  # 4-vCPU arm64 runner
+    print(f"Pass 2/4: Bug Detection (parallel={use_parallel})")
+    print(f"Pass 3/4: Security Scan (parallel={use_parallel})")
+    
+    bugs_failed, security_failed = False, False
+    
+    async def run_bugs():
+        try:
+            return await asyncio.wait_for(
+                llm.chat(
+                    system=system,
+                    user=PROMPT_BUGS.format(context=result.summary, diff=diff_capped),
+                    schema=BUGS_SCHEMA,
+                    max_tokens=4096,
+                    temperature=0.2,
+                ),
+                timeout=_PASS_TIMEOUTS["bugs"],
             )
-            security_task = llm.chat_with_fallback(
-                system=system,
-                user=PROMPT_SECURITY.format(diff=clean_diff),
-                schema=SECURITY_SCHEMA,
-                fallback_value=_FALLBACKS["security"],
-                max_tokens=cfg["max_out_sec"],
-                temperature=0.1,
-                timeout_seconds=_PASS_TIMEOUTS["security"],
+        except (asyncio.TimeoutError, LLMError) as e:
+            print(f"  Bugs failed: {e}")
+            nonlocal bugs_failed
+            bugs_failed = True
+            return _FALLBACKS["bugs"]
+    
+    async def run_security():
+        try:
+            return await asyncio.wait_for(
+                llm.chat(
+                    system=system,
+                    user=PROMPT_SECURITY.format(diff=diff_capped),
+                    schema=SECURITY_SCHEMA,
+                    max_tokens=4096,
+                    temperature=0.1,
+                ),
+                timeout=_PASS_TIMEOUTS["security"],
             )
-            (bugs, bugs_failed), (security, security_failed) = await asyncio.gather(
-                bugs_task, security_task
-            )
-        else:
-            print("[2/4] Bug detection...")
-            bugs, bugs_failed = await llm.chat_with_fallback(
-                system=system, user=PROMPT_BUGS.format(context=context, diff=clean_diff),
-                schema=FINDINGS_SCHEMA, fallback_value=_FALLBACKS["bugs"],
-                max_tokens=cfg["max_out_bugs"], temperature=0.1,
-                timeout_seconds=_PASS_TIMEOUTS["bugs"],
-            )
-            print("[3/4] Security scan...")
-            security, security_failed = await llm.chat_with_fallback(
-                system=system, user=PROMPT_SECURITY.format(diff=clean_diff),
-                schema=SECURITY_SCHEMA, fallback_value=_FALLBACKS["security"],
-                max_tokens=cfg["max_out_sec"], temperature=0.1,
-                timeout_seconds=_PASS_TIMEOUTS["security"],
-            )
-
-        if bugs_failed:
-            failed_passes.append("bugs")
-            warnings.append("⚠️ Bug detection pass failed or timed out.")
-        if security_failed:
-            failed_passes.append("security")
-            warnings.append("⚠️ Security scan pass failed or timed out.")
-
-        # ── Pass 4: Synthesis ────────────────────────────────────────
-        print("[4/4] Synthesis...")
-        
-        # If critical passes failed, force synthesis to use fallback
-        if len(failed_passes) >= 2:
-            print(f"  WARNING: {len(failed_passes)} passes failed, using fallback synthesis.")
-            synthesis = _FALLBACKS["synthesis"]
-            synth_failed = True
-        else:
-            synthesis, synth_failed = await llm.chat_with_fallback(
+        except (asyncio.TimeoutError, LLMError) as e:
+            print(f"  Security failed: {e}")
+            nonlocal security_failed
+            security_failed = True
+            return _FALLBACKS["security"]
+    
+    if use_parallel:
+        bugs_res, security_res = await asyncio.gather(run_bugs(), run_security())
+    else:
+        bugs_res = await run_bugs()
+        security_res = await run_security()
+    
+    if bugs_failed:
+        result.failed_passes.append("bugs")
+    if security_failed:
+        result.failed_passes.append("security")
+    
+    result.bugs = bugs_res.get("findings", [])
+    result.security = security_res.get("findings", [])
+    
+    # Filter out placeholder security findings
+    result.security = [f for f in result.security if f.get("vulnerability_class") != "none_found"]
+    
+    print(f"  Found {len(result.bugs)} bugs, {len(result.security)} security issues")
+    
+    # Pass 4: Synthesis
+    print("Pass 4/4: Synthesis...")
+    try:
+        synth = await asyncio.wait_for(
+            llm.chat(
                 system=system,
                 user=PROMPT_SYNTHESIS.format(
-                    summary=json.dumps(summary),
-                    bugs=json.dumps(bugs),
-                    security=json.dumps(security),
+                    summary=json.dumps({"pr_type": result.pr_type, "description": result.summary}),
+                    bugs=json.dumps(result.bugs[:10]),  # Limit context
+                    security=json.dumps(result.security[:5]),
                 ),
                 schema=SYNTHESIS_SCHEMA,
-                fallback_value=_FALLBACKS["synthesis"],
-                max_tokens=cfg["max_out_synth"],
+                max_tokens=1024,
                 temperature=0.2,
-                timeout_seconds=_PASS_TIMEOUTS["synthesis"],
-            )
+            ),
+            timeout=_PASS_TIMEOUTS["synthesis"],
+        )
+        result.risk_level = synth.get("risk_level", "unknown")
+        result.confidence = synth.get("confidence", 0.0)
+        result.metadata["recommendation"] = synth.get("recommendation", "")
+    except (asyncio.TimeoutError, LLMError) as e:
+        print(f"  Synthesis failed: {e}")
+        result.failed_passes.append("synthesis")
+        synth = _FALLBACKS["synthesis"]
+        result.risk_level = synth["risk_level"]
+        result.confidence = synth["confidence"]
+    
+    # Cap confidence if any pass failed
+    if result.failed_passes and result.confidence > 0.3:
+        result.confidence = min(result.confidence, 0.3)
+        print(f"  Confidence capped due to failures: {result.failed_passes}")
+    
+    result.metadata["failed_passes"] = result.failed_passes
+    print(f"Review complete: risk={result.risk_level}, confidence={result.confidence:.2f}")
+    return result
+
+
+def _format_findings(findings: list, limit: int = 5) -> str:
+    """Format findings for PR comment."""
+    if not findings:
+        return "None detected."
+    
+    findings_sorted = sorted(findings, key=lambda f: SEV_ORDER.get(f.get("severity", "unknown"), 99))
+    lines = []
+    for f in findings_sorted[:limit]:
+        sev = f.get("severity", "info").upper()
+        conf = f.get("confidence", 0) * 100
+        title = f.get("title", "Untitled")
+        file_path = f.get("file_path", "unknown")
+        line_nums = f.get("line_numbers", "?")
         
-        if synth_failed:
-            failed_passes.append("synthesis")
-            warnings.append("⚠️ Synthesis pass failed or timed out.")
-
-    # ── Merge and sort findings ───────────────────────────────────────
-    SEV_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
-    all_findings = bugs.get("findings", []) + security.get("findings", [])
-
-    # Filter out "none_found" security placeholder
-    all_findings = [
-        f for f in all_findings
-        if f.get("vulnerability_class") != "none_found"
-    ]
-
-    # Apply min_severity filter from config
-    min_sev = config.get("review", {}).get("min_severity", "warning")
-    min_level = SEV_ORDER.get(min_sev, 2)
-    all_findings = [
-        f for f in all_findings
-        if SEV_ORDER.get(f.get("severity", "info"), 3) <= min_level
-    ]
-
-    all_findings.sort(key=lambda f: SEV_ORDER.get(f.get("severity", "info"), 3))
-
-    # ── Override risk if passes failed ───────────────────────────────
-    # If analysis is incomplete, be conservative
-    if failed_passes:
-        # If synthesis worked but other passes failed, still flag as uncertain
-        if "synthesis" not in failed_passes:
-            # Keep synthesis result but reduce confidence
-            synthesis["confidence"] = min(synthesis.get("confidence", 0.0), 0.3)
-            if synthesis.get("risk_level") == "low":
-                synthesis["risk_level"] = "medium"
-            if synthesis.get("merge_recommendation") == "approve":
-                synthesis["merge_recommendation"] = "needs_discussion"
+        badge = "🔴" if sev == "CRITICAL" else "🟠" if sev == "ERROR" else "🟡" if sev == "WARNING" else "ℹ️"
+        lines.append(f"{badge} **{title}** ({sev}, {conf:.0f}% conf)\n   `@{file_path}:{line_nums}`")
         
-        # Add note about failed passes
-        if "rationale" in synthesis:
-            synthesis["rationale"] = (
-                f"⚠️ NOTE: Analysis incomplete ({len(failed_passes)} pass(es) failed). "
-                + synthesis["rationale"]
-            )
+        desc = f.get("description", "")
+        if desc:
+            lines.append(f"   > {desc[:200]}{'...' if len(desc) > 200 else ''}")
+        
+        fix = f.get("suggested_fix", "")
+        if fix:
+            lines.append(f"\n   **Suggested fix:**\n   ```\n{fix[:300]}{'...' if len(fix) > 300 else ''}\n   ```")
+        lines.append("")
+    
+    remaining = len(findings_sorted) - limit
+    if remaining > 0:
+        lines.append(f"*... and {remaining} more*")
+    
+    return "\n".join(lines)
 
-    # ── Format and post comment ──────────────────────────────────────
-    elapsed = time.monotonic() - t_start
-    comment = format_review_comment(
-        summary=summary,
-        all_findings=all_findings,
-        verdict=synthesis,
-        warnings=warnings,
-        model_size=model_size,
-        runner_vcpus=runner_vcpus,
-        elapsed_seconds=elapsed,
-        failed_passes=failed_passes,
-    )
 
-    await post_or_update_review_comment(pr, comment)
+def _post_review_comment(pr, result: ReviewResult, model_size: str) -> None:
+    """Post structured review comment to PR."""
+    
+    risk_emoji = {
+        "critical": "🔴 Critical",
+        "high": "🟠 High", 
+        "medium": "🟡 Medium",
+        "low": "🟢 Low",
+        "unknown": "⚪ Unknown",
+    }.get(result.risk_level, "⚪ Unknown")
+    
+    confidence_emoji = "✅" if result.confidence >= 0.8 else "⚠️" if result.confidence >= 0.5 else "❓"
+    
+    body = f"""## Ghost Review Report
 
-    # ── Step summary ─────────────────────────────────────────────────
-    risk    = synthesis.get("risk_level", "unknown")
-    rec     = synthesis.get("merge_recommendation", "unknown")
-    elapsed_min = int(elapsed // 60)
-    elapsed_sec = int(elapsed % 60)
+| Metric | Value |
+|--------|-------|
+| **Risk Level** | {risk_emoji} |
+| **Confidence** | {confidence_emoji} {result.confidence*100:.0f}% |
+| **PR Type** | {result.pr_type.upper()} |
+| **Model** | {model_size.upper()} |
 
-    print(f"\n=== Done in {elapsed_min}m {elapsed_sec}s ===")
-    print(f"Risk: {risk} | Recommendation: {rec} | Findings: {len(all_findings)}")
-    if failed_passes:
-        print(f"⚠️ Failed passes: {', '.join(failed_passes)}")
+### Summary
+{result.summary or "No summary available."}
 
-    summary_lines = [
-        f"## Ghost Review — PR #{pr_number}",
-        f"| Field | Value |",
-        f"|-------|-------|",
-        f"| Risk | {risk} |",
-        f"| Recommendation | {rec} |",
-        f"| Findings | {len(all_findings)} |",
-        f"| Time | {elapsed_min}m {elapsed_sec}s |",
-        f"| Model | qwen2.5-coder-{model_size} |",
-    ]
-    if failed_passes:
-        summary_lines.append(f"| ⚠️ Failed Passes | {len(failed_passes)} |")
-    with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as fh:
-        fh.write("\n".join(summary_lines) + "\n")
+### Security Issues ({len(result.security)})
+{_format_findings(result.security)}
+
+### Bugs & Quality ({len(result.bugs)})
+{_format_findings(result.bugs)}
+
+### Recommendation
+{result.metadata.get("recommendation", "Please review manually.")}
+
+---
+<sub>Generated by Ghost Review • {os.environ.get('RUN_ID', 'local')}</sub>
+"""
+    
+    # Post main comment
+    pr.create_issue_comment(body)
+    
+    # Add review comments for top findings
+    files = {f.get("file_path"): f for f in result.bugs + result.security}
+    for f in result.bugs[:2] + result.security[:2]:
+        try:
+            path = f.get("file_path")
+            line = f.get("line_numbers", "").split("-")[0]
+            if line.isdigit():
+                pr.create_review_comment(
+                    body=f"**{f.get('severity', 'info').upper()}**: {f.get('title', 'Issue')}\n\n{f.get('description', '')[:200]}",
+                    commit_id=pr.head.sha,
+                    path=path,
+                    position=int(line),
+                )
+        except Exception as e:
+            print(f"  Could not post line comment: {e}")
+
+
+async def main():
+    github_token = os.environ["GITHUB_TOKEN"]
+    repo_slug = os.environ["REPO"]
+    pr_number = int(os.environ["PR_NUMBER"])
+    model_size = os.environ.get("MODEL_SIZE", "7b")
+    
+    g = Github(github_token)
+    repo = g.get_repo(repo_slug)
+    pr = repo.get_pull(pr_number)
+    config = load_config(".github/localreviewer.yml")
+    
+    print(f"=== Ghost Review | PR #{pr_number} | model={model_size} ===")
+    
+    # Get diff
+    diff_text = pr.get_diff()
+    if not diff_text:
+        print("No diff found")
+        pr.create_issue_comment("⚠️ Ghost Review: No diff to analyze")
+        return
+    
+    pr_data = {
+        "title": pr.title,
+        "body": pr.body or "",
+        "number": pr_number,
+        "config": config,
+    }
+    
+    # Run review
+    async with LLMClient() as llm:
+        result = await run_review(pr_data, diff_text, model_size, llm)
+    
+    # Post results
+    _post_review_comment(pr, result, model_size)
+    
+    # Summary
+    print(f"=== Review Complete ===")
+    print(f"Risk: {result.risk_level}")
+    print(f"Confidence: {result.confidence:.2f}")
+    print(f"Bugs: {len(result.bugs)}")
+    print(f"Security: {len(result.security)}")
+    if result.failed_passes:
+        print(f"Failed passes: {result.failed_passes}")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_review())
+    asyncio.run(main())
