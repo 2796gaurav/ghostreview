@@ -226,6 +226,9 @@ These issues have been fixed in the current version:
 1. **`AttributeError: 'LLMClient' object has no attribute '_circuit_breaker'`**
    - Fixed: Typo in attribute name (`circuit_breaker` vs `_circuit_breaker`)
    
+2. **`NameError: name 're' is not defined` in auto_fix.py**
+   - Fixed: Added missing `import re` statement
+   
 2. **`error while loading shared libraries: libmtmd.so.0`**
    - Fixed: Build now uses `-DBUILD_SHARED_LIBS=OFF` for static linking
 
