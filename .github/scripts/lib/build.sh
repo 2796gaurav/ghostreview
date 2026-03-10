@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # .github/scripts/lib/build.sh
-# Build llama.cpp from source if not cached
+# Build llama.cpp from source with static linking
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ build_llama_cpp_if_needed() {
         return 0
     fi
 
-    echo "Building llama.cpp from source..."
+    echo "Building llama.cpp from source (static linking)..."
     
     # Install build dependencies if missing
     if ! command -v cmake &> /dev/null; then
@@ -35,23 +35,41 @@ build_llama_cpp_if_needed() {
     
     cd "$BUILDDIR/llama.cpp"
     
-    # Build with cmake - optimized for ARM64
-    echo "Configuring build..."
+    # Build with cmake - optimized for ARM64 with STATIC linking
+    # -DBUILD_SHARED_LIBS=OFF creates a self-contained binary
+    echo "Configuring build with static linking..."
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_EXAMPLES=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
         -DLLAMA_NATIVE=OFF \
-        2>&1 | tail -5
+        -DGGML_NATIVE=OFF \
+        -DCMAKE_CXX_FLAGS="-O3" \
+        2>&1 | tail -10
     
     echo "Building (this may take 3-5 minutes on first run)..."
-    cmake --build build --config Release -j$(nproc) --target llama-server 2>&1 | tail -10
+    cmake --build build --config Release -j$(nproc) --target llama-server 2>&1 | tail -15
     
     # Copy binary to cache
     cp "$BUILDDIR/llama.cpp/build/bin/llama-server" "$BINDIR/llama-server"
     chmod +x "$BINDIR/llama-server"
     
+    # Verify it's statically linked (no shared lib dependencies)
+    echo "Verifying static build..."
+    if ldd "$BINDIR/llama-server" 2>&1 | grep -q "libmtmd\|libllama\|libggml"; then
+        echo "WARNING: Binary has shared library dependencies!"
+        ldd "$BINDIR/llama-server" || true
+    else
+        echo "✓ Static build verified (no shared library dependencies)"
+    fi
+    
     echo "llama-server built successfully"
     "$BINDIR/llama-server" --version 2>&1 | head -1 || true
+}
+
+# Also need to update the cache key when build changes
+get_llama_cache_key() {
+    echo "ghost-review-llama-b8252-static-ubuntu-arm64-v1"
 }

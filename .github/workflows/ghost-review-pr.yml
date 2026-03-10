@@ -72,7 +72,7 @@ jobs:
         id: llama-cache
         with:
           path: ~/.cache/ghost-review/llama-bin
-          key: ghost-review-llama-b8252-ubuntu-arm64-v2
+          key: ghost-review-llama-b8252-static-ubuntu-arm64-v3
 
       # ── Build llama.cpp if not cached ──────────────────────────────
       - name: Build llama.cpp

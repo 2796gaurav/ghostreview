@@ -17,7 +17,7 @@ wait_for_server() {
     local MAX_WAIT="${1:-90}"
     local ELAPSED=0
 
-    echo -n "Waiting for llama-server..."
+    echo -n "Waiting for llama-server"
     while [[ $ELAPSED -lt $MAX_WAIT ]]; do
         HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             http://127.0.0.1:8080/health 2>/dev/null || echo "000")
@@ -32,7 +32,15 @@ wait_for_server() {
             if ! kill -0 "$PID" 2>/dev/null; then
                 echo ""
                 echo "ERROR: llama-server (PID $PID) died. Logs:"
-                tail -50 "$LLAMA_LOG_FILE" || true
+                tail -100 "$LLAMA_LOG_FILE" || true
+                
+                # Check for shared library error
+                if tail -20 "$LLAMA_LOG_FILE" 2>/dev/null | grep -q "error while loading shared libraries"; then
+                    echo ""
+                    echo "HINT: This is a shared library error. The binary may need to be rebuilt with static linking."
+                    echo "Try clearing the cache and re-running the workflow."
+                fi
+                
                 exit 1
             fi
         fi
@@ -43,8 +51,42 @@ wait_for_server() {
 
     echo ""
     echo "ERROR: llama-server did not become healthy within ${MAX_WAIT}s. Logs:"
-    tail -50 "$LLAMA_LOG_FILE" || true
+    tail -100 "$LLAMA_LOG_FILE" || true
     exit 1
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# verify_binary — check binary exists and is executable
+# ──────────────────────────────────────────────────────────────────────
+verify_binary() {
+    if [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
+        echo "ERROR: llama-server binary not found at $LLAMA_SERVER_BIN"
+        echo "The binary may not have been built or cached properly."
+        exit 1
+    fi
+    
+    if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
+        echo "Making binary executable..."
+        chmod +x "$LLAMA_SERVER_BIN"
+    fi
+    
+    # Test binary can execute (check for shared lib errors)
+    if ! "$LLAMA_SERVER_BIN" --version &>/dev/null; then
+        echo "ERROR: llama-server binary cannot execute. Testing for errors..."
+        "$LLAMA_SERVER_BIN" --version 2>&1 || true
+        
+        # Check for shared library issues
+        if ldd "$LLAMA_SERVER_BIN" 2>&1 | grep -q "not found"; then
+            echo ""
+            echo "Shared library dependencies missing:"
+            ldd "$LLAMA_SERVER_BIN" 2>&1 | grep "not found" || true
+            echo ""
+            echo "SOLUTION: Rebuild with static linking by clearing the llama-bin cache."
+        fi
+        exit 1
+    fi
+    
+    echo "Binary verified: $(${LLAMA_SERVER_BIN} --version 2>&1 | head -1)"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -61,7 +103,11 @@ _start_server() {
     local PARALLEL="$7"
     local KEEP="$8"
 
+    # Verify binary first
+    verify_binary
+
     echo "Starting llama-server:"
+    echo "  Binary     : ${LLAMA_SERVER_BIN}"
     echo "  Model      : ${MODEL##*/}"
     echo "  Context    : ${CTX} tokens"
     echo "  Threads    : ${THREADS}"
@@ -69,22 +115,6 @@ _start_server() {
     echo "  Max output : ${N_PREDICT} tokens"
     echo "  Parallel   : ${PARALLEL} slots"
     echo "  KV keep    : ${KEEP} tokens"
-
-    # Verify binary exists
-    if [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
-        echo "ERROR: llama-server not found at $LLAMA_SERVER_BIN"
-        echo "Checking if available in PATH..."
-        if command -v llama-server &> /dev/null; then
-            LLAMA_SERVER_BIN=$(which llama-server)
-            echo "Found llama-server in PATH: $LLAMA_SERVER_BIN"
-        else
-            echo "ERROR: llama-server not found in PATH either"
-            exit 1
-        fi
-    fi
-
-    echo "Using llama-server: $LLAMA_SERVER_BIN"
-    "$LLAMA_SERVER_BIN" --version 2>&1 | head -1 || true
 
     # New llama.cpp (b8252+) uses different flag syntax:
     # --flash-attn on (instead of just --flash-attn)
@@ -167,10 +197,15 @@ stop_server() {
         local PID
         PID=$(cat "$LLAMA_PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
+            echo "Stopping llama-server (PID $PID)..."
             kill -TERM "$PID" 2>/dev/null || true
             wait "$PID" 2>/dev/null || true
+            echo "llama-server stopped."
+        else
+            echo "llama-server already stopped."
         fi
         rm -f "$LLAMA_PID_FILE"
-        echo "llama-server stopped."
+    else
+        echo "No PID file found."
     fi
 }
