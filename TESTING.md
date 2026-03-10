@@ -8,7 +8,7 @@ This document explains how to test both the PR Review and Auto-Fix features.
 
 PR Review is triggered automatically when a pull request is opened or updated.
 
-### Test Branch: `test/pr-review-bugs-v2`
+### Test Branch: `test/pr-review-bugs-v3`
 
 This branch contains `test_app/calculator.py` with intentional bugs for testing.
 
@@ -17,10 +17,10 @@ This branch contains `test_app/calculator.py` with intentional bugs for testing.
 1. **Create the PR** (one-time setup):
    ```bash
    # Go to GitHub and create a PR:
-   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-bugs-v2
+   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-bugs-v3
    # 
    # Or use gh CLI:
-   gh pr create --base main --head test/pr-review-bugs-v2 \
+   gh pr create --base main --head test/pr-review-bugs-v3 \
      --title "TEST: PR Review with intentional bugs" \
      --body "This PR tests the Ghost Review PR analysis feature. It contains intentional security issues and bugs that should be detected."
    ```
@@ -218,6 +218,22 @@ This means the branch is identical to main. The test branch has changes now.
 - The cache key includes version numbers
 - Updating the key forces a fresh build
 - Current key: `ghost-review-llama-b8252-static-ubuntu-arm64-v3`
+
+### Fixed Issues (for reference)
+
+These issues have been fixed in the current version:
+
+1. **`AttributeError: 'LLMClient' object has no attribute '_circuit_breaker'`**
+   - Fixed: Typo in attribute name (`circuit_breaker` vs `_circuit_breaker`)
+   
+2. **`error while loading shared libraries: libmtmd.so.0`**
+   - Fixed: Build now uses `-DBUILD_SHARED_LIBS=OFF` for static linking
+
+3. **Token count showing 0/0 in metadata**
+   - Fixed: Removed placeholder token counts from display
+
+4. **Auto-fix giving up too early**
+   - Fixed: Added better ReAct prompts and exploration strategy
 
 ---
 
