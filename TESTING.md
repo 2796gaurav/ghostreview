@@ -107,17 +107,35 @@ Auto-Fix requires **write permission** and the **7B model**.
 
 ### Test Issues to Create
 
-#### Test 1: Simple Division by Zero
+#### Test 1: Simple Division by Zero (Recommended First Test)
+```markdown
+Title: Fix division by zero in examples/calc.py
+
+The divide() function in examples/calc.py crashes when dividing by zero.
+Add a check to handle this case gracefully.
+
+Current code:
+```python
+def divide(a, b):
+    return a / b  # Bug: no division by zero check
+```
+
+Expected: Return None or raise ValueError when b is 0.
+```
+
+**Note**: There's a test file at `examples/calc.py` on branch `test/auto-fix-simple` that you can reference.
+
+#### Test 2: Fix division by zero in test_app/calculator.py
 ```markdown
 Title: Fix division by zero in calculator.py
 
-The divide() function crashes on zero input. Add a check to return None 
-or raise a proper exception when dividing by zero.
+The divide() function in test_app/calculator.py crashes on zero input. 
+Add a check to return None or raise a proper exception when dividing by zero.
 
 File: test_app/calculator.py
 ```
 
-#### Test 2: Add Timeout to fetch_data
+#### Test 3: Add Timeout to fetch_data
 ```markdown
 Title: Add timeout to fetch_data function
 
@@ -125,7 +143,7 @@ test_app/calculator.py's fetch_data() function uses urlopen without a timeout.
 This could hang indefinitely. Add a timeout parameter.
 ```
 
-#### Test 3: Remove eval() usage
+#### Test 4: Remove eval() usage
 ```markdown
 Title: Replace eval() with safer alternative in calculate()
 
