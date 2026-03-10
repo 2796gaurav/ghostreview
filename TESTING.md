@@ -269,9 +269,33 @@ The recent update includes these algorithmic improvements:
 5. **ReAct Pattern**: Agent explores → analyzes → patches → verifies
 6. **Reflection**: Low-confidence patches get second-pass verification
 7. **Static Linking**: Self-contained binary without shared library dependencies
+8. **Self-Healing Auto-Fix**: Catches errors, analyzes with model, retries (max 10 times)
+
+### Self-Healing Auto-Fix Details
+
+The Auto-Fix agent now has error recovery capabilities:
+
+- **Error Detection**: Syntax errors, import errors, and runtime errors are caught
+- **Reflection Mode**: When an error occurs, the agent enters reflection mode
+- **Error Analysis**: The error + traceback is sent to the LLM for analysis
+- **Auto-Correction**: The model suggests corrected code
+- **Retry Loop**: Up to 10 attempts to generate valid code
+- **Partial PR**: If max retries reached, creates draft PR with error notes for manual fix
+
+This prevents issues like:
+- Missing imports (e.g., `import re`)
+- Syntax errors in generated patches
+- Undefined variables
+- Code that doesn't compile
+
+Verify by checking Action logs for:
+- "[explore/REFLECT]" mode indicator
+- "CODE TEST FAILED" → corrected in next iteration
+- "Encountered and resolved X error(s)" in success comments
 
 Verify these by checking the Action logs for:
 - "Compressed X repetitive hunks" (compression working)
 - "Split into N chunk(s)" (chunking working)
 - "[explore]" / "[analyze]" / "[patch]" phase indicators (ReAct working)
+- "[explore/REFLECT]" (self-healing working)
 - "✓ Static build verified" (static linking working)
