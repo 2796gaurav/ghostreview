@@ -264,6 +264,13 @@ These issues have been fixed in the current version:
    - Fixed: Added real-time progress logging
    - Cause: Was waiting indefinitely for model response
 
+6. **TIMEOUT errors on every request (60s too short)**
+   - Fixed: Increased read timeout 60s → 180s (3 minutes)
+   - Fixed: Changed server parallel=2 → parallel=1 (sequential faster)
+   - Fixed: Reduced max_tokens 4096 → 1024 (ARM64 does ~5 tok/s)
+   - Fixed: Optimized batch sizes for lower latency
+   - Cause: ARM64 inference is slow, 4096 tokens = 13+ minutes at 5 tok/s
+
 ---
 
 ## Algorithmic Improvements Tested
