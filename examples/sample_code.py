@@ -2,7 +2,6 @@
 Sample code to test Ghost Review PR analysis.
 This file contains intentional issues for testing.
 """
-
 import os
 import subprocess
 
