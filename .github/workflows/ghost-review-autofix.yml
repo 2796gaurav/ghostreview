@@ -90,17 +90,25 @@ jobs:
           pip install -q -r .github/scripts/requirements.txt \
             --break-system-packages
 
-      # ── Cache: GGUF model files (7B + 3B combined, ~6.9 GB) ────────
-      - name: Cache LLM models
+      # ── Detect runner config (sets MODEL_SIZE env var) ─────────────
+      - name: Detect runner configuration
+        if: steps.perms.outputs.allowed == 'true'
+        id: detect
+        run: |
+          source .github/scripts/lib/detect.sh
+          detect_runner_config
+          echo "model_size=${MODEL_SIZE}" >> "$GITHUB_OUTPUT"
+
+      # ── Cache: GGUF model file (only the one we'll use) ────────────
+      - name: Cache LLM model
         if: steps.perms.outputs.allowed == 'true'
         uses: actions/cache@v4
+        id: model-cache
         with:
           path: ~/.cache/ghost-review/models
-          key: ghost-review-models-qwen2.5-coder-7b3b-q4km-v1
-          restore-keys: |
-            ghost-review-models-qwen2.5-coder-
+          key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
 
-      # ── Setup: detect runner + download models + start server ──────
+      # ── Setup: download model + start server ───────────────────────
       - name: Setup inference engine
         if: steps.perms.outputs.allowed == 'true'
         run: bash .github/scripts/setup_inference.sh

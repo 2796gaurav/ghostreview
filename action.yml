@@ -29,15 +29,6 @@ runs:
       with:
         fetch-depth: 0
 
-    - name: Cache LLM models
-      uses: actions/cache@v4
-      id: model-cache
-      with:
-        path: ~/.cache/ghost-review/models
-        key: ghost-review-models-qwen2.5-coder-7b3b-q4km-v1
-        restore-keys: |
-          ghost-review-models-qwen2.5-coder-
-
     - name: Cache Python packages
       uses: actions/cache@v4
       with:
@@ -45,17 +36,33 @@ runs:
         key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
         restore-keys: ghost-review-pip-
 
-    - name: Setup inference engine
-      shell: bash
-      env:
-        MODEL_SIZE_OVERRIDE: ${{ inputs.model-size }}
-      run: bash ${{ github.action_path }}/.github/scripts/setup_inference.sh
-
     - name: Install Python dependencies
       shell: bash
       run: |
         pip install -q -r ${{ github.action_path }}/.github/scripts/requirements.txt \
           --break-system-packages
+
+    - name: Detect runner configuration
+      id: detect
+      shell: bash
+      env:
+        MODEL_SIZE_OVERRIDE: ${{ inputs.model-size }}
+      run: |
+        source ${{ github.action_path }}/.github/scripts/lib/detect.sh
+        detect_runner_config
+        echo "model_size=${MODEL_SIZE}" >> "$GITHUB_OUTPUT"
+
+    - name: Cache LLM model
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ghost-review/models
+        key: ghost-review-model-${{ steps.detect.outputs.model_size }}-q4km-v1
+
+    - name: Setup inference engine
+      shell: bash
+      env:
+        MODEL_SIZE_OVERRIDE: ${{ inputs.model-size }}
+      run: bash ${{ github.action_path }}/.github/scripts/setup_inference.sh
 
     - name: Run PR review
       shell: bash
