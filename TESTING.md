@@ -8,7 +8,7 @@ This document explains how to test both the PR Review and Auto-Fix features.
 
 PR Review is triggered automatically when a pull request is opened or updated.
 
-### Test Branch: `test/pr-review-with-bugs`
+### Test Branch: `test/pr-review-bugs-v2`
 
 This branch contains `test_app/calculator.py` with intentional bugs for testing.
 
@@ -17,10 +17,10 @@ This branch contains `test_app/calculator.py` with intentional bugs for testing.
 1. **Create the PR** (one-time setup):
    ```bash
    # Go to GitHub and create a PR:
-   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-with-bugs
+   # https://github.com/2796gaurav/ghostreview/compare/main...test/pr-review-bugs-v2
    # 
    # Or use gh CLI:
-   gh pr create --base main --head test/pr-review-with-bugs \
+   gh pr create --base main --head test/pr-review-bugs-v2 \
      --title "TEST: PR Review with intentional bugs" \
      --body "This PR tests the Ghost Review PR analysis feature. It contains intentional security issues and bugs that should be detected."
    ```
@@ -153,6 +153,8 @@ To debug issues:
 1. Go to the Actions run
 2. Look for these key steps:
    - **Detect runner configuration** - Shows model selection (7b/3b)
+   - **Cache llama.cpp binary** - Should show cache miss on first run
+   - **Build llama.cpp** - Shows static linking build
    - **Start inference server** - Shows llama-server startup
    - **Run PR review** - Shows the 4-pass analysis
 
@@ -160,6 +162,20 @@ To debug issues:
    - Token counts
    - Pass timings
    - Any errors or timeouts
+
+### Fixing Shared Library Errors
+
+If you see:
+```
+error while loading shared libraries: libmtmd.so.0: cannot open shared object file
+```
+
+The cache needs to be cleared. The build script has been updated to use static linking.
+To clear the cache:
+1. Go to **Actions** → **Caches**
+2. Find `ghost-review-llama-*` cache
+3. Delete it
+4. Re-run the workflow
 
 ---
 
@@ -192,10 +208,16 @@ This means the branch is identical to main. The test branch has changes now.
 - If a pass times out, the review continues with partial results
 - Check the comment for "Analysis Incomplete" warnings
 
-### Server startup failures
-- Check the **Start inference server** logs
-- Look for port conflicts or memory issues
-- The server requires ~6GB RAM for 7B model
+### Server startup failures (libmtmd.so.0 not found)
+- This was caused by shared library dependencies
+- **Solution**: The build script now uses `-DBUILD_SHARED_LIBS=OFF`
+- Clear the llama-bin cache and re-run
+- New cache key: `ghost-review-llama-b8252-static-ubuntu-arm64-v3`
+
+### Build cache not updating
+- The cache key includes version numbers
+- Updating the key forces a fresh build
+- Current key: `ghost-review-llama-b8252-static-ubuntu-arm64-v3`
 
 ---
 
@@ -209,8 +231,10 @@ The recent update includes these algorithmic improvements:
 4. **Circuit Breaker**: Fault tolerance for LLM server failures
 5. **ReAct Pattern**: Agent explores → analyzes → patches → verifies
 6. **Reflection**: Low-confidence patches get second-pass verification
+7. **Static Linking**: Self-contained binary without shared library dependencies
 
 Verify these by checking the Action logs for:
 - "Compressed X repetitive hunks" (compression working)
 - "Split into N chunk(s)" (chunking working)
 - "[explore]" / "[analyze]" / "[patch]" phase indicators (ReAct working)
+- "✓ Static build verified" (static linking working)
