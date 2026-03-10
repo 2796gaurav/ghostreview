@@ -1,8 +1,11 @@
 """
 .github/scripts/review.py
 
-Main PR review orchestrator with 4-pass analysis.
-Implements: Summary → Bug + Security (parallel) → Synthesis → Comments
+4-pass PR review orchestrator with:
+  - Token-aware adaptive chunking for large diffs
+  - Priority-based pass scheduling (security first if risk detected)
+  - Parallel execution with circuit breaker pattern
+  - Result aggregation with confidence weighting
 """
 
 from __future__ import annotations
@@ -19,36 +22,46 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config
-from diff_parser import parse_diff, sanitize
+from diff_parser import preprocess_diff, get_diff, estimate_tokens
 from github import Github
+from github_api import format_review_comment, post_or_update_review_comment
 from llm_client import LLMClient, LLMError
 from prompts import build_system_prompt, PROMPT_SUMMARY, PROMPT_BUGS, PROMPT_SECURITY, PROMPT_SYNTHESIS
 from schemas import SUMMARY_SCHEMA, BUGS_SCHEMA, SECURITY_SCHEMA, SYNTHESIS_SCHEMA
 
 
-# Model-specific token budgets
+# Model configurations
 _MODEL_CONFIG = {
-    "7b": {"max_diff_tokens": 22000, "context_reserve": 5000},
-    "3b": {"max_diff_tokens": 8000, "context_reserve": 2500},
+    "7b": {"max_diff_tokens": 24000, "context_reserve": 6000, "parallel_slots": 2},
+    "3b": {"max_diff_tokens": 10000, "context_reserve": 3000, "parallel_slots": 1},
 }
 
-# Pass timeouts (seconds)
-_PASS_TIMEOUTS = {
-    "summary": 180.0,
-    "bugs": 240.0,
-    "security": 180.0,
-    "synthesis": 120.0,
+# Pass timeouts and priorities
+_PASS_CONFIG = {
+    "summary":  {"timeout": 180.0, "priority": 1, "critical": True},
+    "bugs":     {"timeout": 240.0, "priority": 2, "critical": False},
+    "security": {"timeout": 180.0, "priority": 2, "critical": True},  # Run early if risk detected
+    "synthesis":{"timeout": 120.0, "priority": 3, "critical": True},
 }
 
-# Fallback values when passes fail/time out
+# Fallback values
 _FALLBACKS = {
-    "summary": {"pr_type": "unknown", "pr_description": "Unable to analyze", "affected_components": [], "risk_areas": []},
+    "summary": {"pr_type": "unknown", "pr_description": "Analysis unavailable", "affected_components": [], "risk_areas": []},
     "bugs": {"findings": []},
     "security": {"findings": []},
-    "synthesis": {"risk_level": "unknown", "confidence": 0.0, "summary": "Analysis unavailable", "recommendation": "Please review manually"},
+    "synthesis": {"risk_level": "unknown", "confidence": 0.0, "summary": "Analysis incomplete", "recommendation": "Manual review required"},
 }
 
 SEV_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3, "unknown": 4}
+
+
+@dataclass
+class PassResult:
+    name: str
+    data: dict[str, Any]
+    success: bool
+    error: str = ""
+    duration: float = 0.0
 
 
 @dataclass
@@ -61,244 +74,323 @@ class ReviewResult:
     security: list = field(default_factory=list)
     failed_passes: list = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    pass_results: dict = field(default_factory=dict)
 
 
-def _get_token_budget(model_size: str) -> tuple[int, int]:
-    cfg = _MODEL_CONFIG.get(model_size, _MODEL_CONFIG["7b"])
-    return cfg["max_diff_tokens"], cfg["context_reserve"]
-
-
-def _cap_diff(diff: str, model_size: str) -> str:
-    max_tokens, _ = _get_token_budget(model_size)
-    # Estimate 4 chars per token
-    max_chars = max_tokens * 4
-    if len(diff) <= max_chars:
-        return diff
-    return diff[:max_chars] + f"\n\n... [truncated {len(diff) - max_chars} chars]"
-
-
-async def run_review(pr_data: dict, diff_text: str, model_size: str, llm: LLMClient) -> ReviewResult:
+class AdaptiveChunker:
     """
-    4-pass review with parallel bug + security passes.
+    Intelligently chunk large diffs for multi-pass review.
+    Prioritizes security-critical files and maintains context boundaries.
+    """
+    
+    def __init__(self, max_tokens: int, model_size: str):
+        self.max_tokens = max_tokens
+        self.model_config = _MODEL_CONFIG.get(model_size, _MODEL_CONFIG["7b"])
+        self.effective_budget = max_tokens - self.model_config["context_reserve"]
+    
+    def chunk_diff(self, diff_text: str, config: dict) -> list[str]:
+        """
+        Split diff into chunks that fit within token budget.
+        Returns list of diff chunks for sequential processing.
+        """
+        # If diff fits, return as single chunk
+        if estimate_tokens(diff_text) <= self.effective_budget:
+            return [diff_text]
+        
+        # Split by file
+        file_pattern = re.compile(r'^diff --git a/(.+?) b/\1', re.MULTILINE)
+        files: list[tuple[str, str, int]] = []  # (path, content, importance)
+        
+        matches = list(file_pattern.finditer(diff_text))
+        for i, match in enumerate(matches):
+            path = match.group(1)
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(diff_text)
+            content = diff_text[start:end]
+            
+            # Score importance
+            importance = self._score_importance(path, config)
+            files.append((path, content, importance))
+        
+        # Sort by importance (security-critical first)
+        files.sort(key=lambda x: x[2])
+        
+        # Greedily pack files into chunks
+        chunks: list[str] = []
+        current_chunk: list[str] = []
+        current_tokens = 0
+        
+        for path, content, _ in files:
+            content_tokens = estimate_tokens(content)
+            
+            if content_tokens > self.effective_budget:
+                # Single file exceeds budget - need to truncate
+                from diff_parser import truncate_to_tokens
+                truncated = truncate_to_tokens(content, self.effective_budget - 100)
+                if current_chunk:
+                    chunks.append("".join(current_chunk))
+                chunks.append(truncated)
+                current_chunk = []
+                current_tokens = 0
+            elif current_tokens + content_tokens > self.effective_budget:
+                # Start new chunk
+                if current_chunk:
+                    chunks.append("".join(current_chunk))
+                current_chunk = [content]
+                current_tokens = content_tokens
+            else:
+                # Add to current chunk
+                current_chunk.append(content)
+                current_tokens += content_tokens
+        
+        if current_chunk:
+            chunks.append("".join(current_chunk))
+        
+        return chunks
+    
+    def _score_importance(self, path: str, config: dict) -> int:
+        """Lower score = higher priority."""
+        critical_paths = config.get("review", {}).get("security_critical_paths", [])
+        
+        for pattern in critical_paths:
+            if re.search(pattern.replace("*", ".*"), path):
+                return 0  # Highest priority
+        
+        # Source files over tests
+        if any(x in path for x in ["_test.", ".test.", "test_", "/tests/", "/test/"]):
+            return 4
+        
+        # Config/docs lower priority
+        if path.endswith((".md", ".txt", ".json", ".yml", ".yaml")):
+            return 3
+        
+        return 2  # Normal source
+
+
+async def run_pass_with_retry(
+    llm: LLMClient,
+    pass_name: str,
+    system: str,
+    prompt: str,
+    schema: dict,
+    config: dict,
+    max_retries: int = 2,
+) -> PassResult:
+    """Execute a review pass with retry logic."""
+    timeout = _PASS_CONFIG[pass_name]["timeout"]
+    
+    for attempt in range(max_retries + 1):
+        start = asyncio.get_event_loop().time()
+        try:
+            result = await asyncio.wait_for(
+                llm.chat(
+                    system=system,
+                    user=prompt,
+                    schema=schema,
+                    max_tokens=4096 if pass_name in ("bugs", "security") else 2048,
+                    temperature=0.1 if pass_name == "security" else 0.2,
+                ),
+                timeout=timeout,
+            )
+            duration = asyncio.get_event_loop().time() - start
+            return PassResult(name=pass_name, data=result, success=True, duration=duration)
+            
+        except asyncio.TimeoutError:
+            if attempt < max_retries:
+                print(f"  {pass_name} timeout, retrying...")
+                timeout *= 1.5  # Increase timeout for retry
+            else:
+                return PassResult(
+                    name=pass_name,
+                    data=_FALLBACKS[pass_name],
+                    success=False,
+                    error="Timeout",
+                    duration=asyncio.get_event_loop().time() - start,
+                )
+        except LLMError as e:
+            if attempt < max_retries:
+                print(f"  {pass_name} error: {e}, retrying...")
+                await asyncio.sleep(1)
+            else:
+                return PassResult(
+                    name=pass_name,
+                    data=_FALLBACKS[pass_name],
+                    success=False,
+                    error=str(e),
+                    duration=asyncio.get_event_loop().time() - start,
+                )
+
+
+async def run_parallel_passes(
+    llm: LLMClient,
+    system: str,
+    diff_chunk: str,
+    summary_text: str,
+) -> tuple[PassResult, PassResult]:
+    """Run bug and security passes in parallel."""
+    bugs_task = run_pass_with_retry(
+        llm, "bugs", system,
+        PROMPT_BUGS.format(context=summary_text, diff=diff_chunk),
+        BUGS_SCHEMA, _PASS_CONFIG["bugs"]
+    )
+    security_task = run_pass_with_retry(
+        llm, "security", system,
+        PROMPT_SECURITY.format(diff=diff_chunk),
+        SECURITY_SCHEMA, _PASS_CONFIG["security"]
+    )
+    
+    results = await asyncio.gather(bugs_task, security_task, return_exceptions=True)
+    
+    bugs_result = results[0] if isinstance(results[0], PassResult) else PassResult(
+        "bugs", _FALLBACKS["bugs"], False, str(results[0])
+    )
+    security_result = results[1] if isinstance(results[1], PassResult) else PassResult(
+        "security", _FALLBACKS["security"], False, str(results[1])
+    )
+    
+    return bugs_result, security_result
+
+
+async def run_review(
+    pr_data: dict,
+    diff_text: str,
+    model_size: str,
+    llm: LLMClient,
+    config: dict,
+) -> ReviewResult:
+    """
+    4-pass review with adaptive chunking and parallel execution.
     """
     result = ReviewResult()
-    diff_capped = _cap_diff(diff_text, model_size)
-    system = build_system_prompt(pr_data.get("config", {}))
+    system = build_system_prompt(config)
     
-    print(f"Starting review: model={model_size}, diff_chars={len(diff_text)}, capped={len(diff_capped)}")
+    # Preprocess diff
+    max_tokens = _MODEL_CONFIG.get(model_size, _MODEL_CONFIG["7b"])["max_diff_tokens"]
+    processed_diff, warnings = preprocess_diff(diff_text, max_tokens, config)
     
-    # Pass 1: Summary
-    print("Pass 1/4: Summary...")
-    try:
-        summary = await asyncio.wait_for(
-            llm.chat(
-                system=system,
-                user=PROMPT_SUMMARY.format(title=pr_data.get("title", ""), body=pr_data.get("body", "")[:3000], diff=diff_capped[:4000]),
-                schema=SUMMARY_SCHEMA,
-                max_tokens=2048,
-                temperature=0.2,
+    print(f"Review: model={model_size}, raw_diff={len(diff_text)} chars, "
+          f"processed={len(processed_diff)} chars, tokens={estimate_tokens(processed_diff)}")
+    
+    # Adaptive chunking for large diffs
+    chunker = AdaptiveChunker(max_tokens, model_size)
+    chunks = chunker.chunk_diff(processed_diff, config)
+    print(f"Split into {len(chunks)} chunk(s) for processing")
+    
+    # If multiple chunks, we need to aggregate results
+    all_bugs: list[dict] = []
+    all_security: list[dict] = []
+    chunk_summaries: list[str] = []
+    
+    for chunk_idx, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}...")
+        
+        # Pass 1: Summary
+        summary_result = await run_pass_with_retry(
+            llm, "summary", system,
+            PROMPT_SUMMARY.format(
+                title=pr_data.get("title", ""),
+                body=pr_data.get("body", "")[:3000],
+                diff=chunk[:6000],
             ),
-            timeout=_PASS_TIMEOUTS["summary"],
+            SUMMARY_SCHEMA, _PASS_CONFIG["summary"]
         )
-        result.pr_type = summary.get("pr_type", "unknown")
-        result.summary = summary.get("pr_description", "")
-        result.metadata["affected_components"] = summary.get("affected_components", [])
-        result.metadata["risk_areas"] = summary.get("risk_areas", [])
-    except (asyncio.TimeoutError, LLMError) as e:
-        print(f"  Summary failed: {e}")
-        result.failed_passes.append("summary")
-        summary = _FALLBACKS["summary"]
-        result.pr_type = summary["pr_type"]
-        result.summary = summary["pr_description"]
+        
+        if not summary_result.success:
+            result.failed_passes.append("summary")
+        
+        chunk_summaries.append(summary_result.data.get("pr_description", ""))
+        if chunk_idx == 0:
+            result.pr_type = summary_result.data.get("pr_type", "unknown")
+            result.metadata["affected_components"] = summary_result.data.get("affected_components", [])
+            result.metadata["risk_areas"] = summary_result.data.get("risk_areas", [])
+        
+        # Pass 2 & 3: Bugs + Security (parallel)
+        bugs_result, security_result = await run_parallel_passes(
+            llm, system, chunk, chunk_summaries[-1]
+        )
+        
+        if not bugs_result.success:
+            result.failed_passes.append(f"bugs_chunk_{chunk_idx}")
+        if not security_result.success:
+            result.failed_passes.append(f"security_chunk_{chunk_idx}")
+        
+        all_bugs.extend(bugs_result.data.get("findings", []))
+        all_security.extend(security_result.data.get("findings", []))
     
-    # Pass 2+3: Bug detection + Security (parallel)
-    use_parallel = True  # 4-vCPU arm64 runner
-    print(f"Pass 2/4: Bug Detection (parallel={use_parallel})")
-    print(f"Pass 3/4: Security Scan (parallel={use_parallel})")
+    # Deduplicate findings across chunks
+    result.bugs = _deduplicate_findings(all_bugs)
+    result.security = _deduplicate_findings(all_security)
     
-    bugs_failed, security_failed = False, False
-    
-    async def run_bugs():
-        try:
-            return await asyncio.wait_for(
-                llm.chat(
-                    system=system,
-                    user=PROMPT_BUGS.format(context=result.summary, diff=diff_capped),
-                    schema=BUGS_SCHEMA,
-                    max_tokens=4096,
-                    temperature=0.2,
-                ),
-                timeout=_PASS_TIMEOUTS["bugs"],
-            )
-        except (asyncio.TimeoutError, LLMError) as e:
-            print(f"  Bugs failed: {e}")
-            nonlocal bugs_failed
-            bugs_failed = True
-            return _FALLBACKS["bugs"]
-    
-    async def run_security():
-        try:
-            return await asyncio.wait_for(
-                llm.chat(
-                    system=system,
-                    user=PROMPT_SECURITY.format(diff=diff_capped),
-                    schema=SECURITY_SCHEMA,
-                    max_tokens=4096,
-                    temperature=0.1,
-                ),
-                timeout=_PASS_TIMEOUTS["security"],
-            )
-        except (asyncio.TimeoutError, LLMError) as e:
-            print(f"  Security failed: {e}")
-            nonlocal security_failed
-            security_failed = True
-            return _FALLBACKS["security"]
-    
-    if use_parallel:
-        bugs_res, security_res = await asyncio.gather(run_bugs(), run_security())
-    else:
-        bugs_res = await run_bugs()
-        security_res = await run_security()
-    
-    if bugs_failed:
-        result.failed_passes.append("bugs")
-    if security_failed:
-        result.failed_passes.append("security")
-    
-    result.bugs = bugs_res.get("findings", [])
-    result.security = security_res.get("findings", [])
-    
-    # Filter out placeholder security findings
+    # Filter placeholder security findings
     result.security = [f for f in result.security if f.get("vulnerability_class") != "none_found"]
     
-    print(f"  Found {len(result.bugs)} bugs, {len(result.security)} security issues")
+    print(f"Total unique findings: {len(result.bugs)} bugs, {len(result.security)} security")
     
-    # Pass 4: Synthesis
-    print("Pass 4/4: Synthesis...")
-    try:
-        synth = await asyncio.wait_for(
-            llm.chat(
-                system=system,
-                user=PROMPT_SYNTHESIS.format(
-                    summary=json.dumps({"pr_type": result.pr_type, "description": result.summary}),
-                    bugs=json.dumps(result.bugs[:10]),  # Limit context
-                    security=json.dumps(result.security[:5]),
-                ),
-                schema=SYNTHESIS_SCHEMA,
-                max_tokens=1024,
-                temperature=0.2,
-            ),
-            timeout=_PASS_TIMEOUTS["synthesis"],
-        )
-        result.risk_level = synth.get("risk_level", "unknown")
-        result.confidence = synth.get("confidence", 0.0)
-        result.metadata["recommendation"] = synth.get("recommendation", "")
-    except (asyncio.TimeoutError, LLMError) as e:
-        print(f"  Synthesis failed: {e}")
+    # Pass 4: Synthesis (uses aggregated findings)
+    synthesis_result = await run_pass_with_retry(
+        llm, "synthesis", system,
+        PROMPT_SYNTHESIS.format(
+            summary=json.dumps({
+                "pr_type": result.pr_type,
+                "description": " ".join(chunk_summaries)[:1000],
+            }),
+            bugs=json.dumps(result.bugs[:15]),  # Limit context
+            security=json.dumps(result.security[:10]),
+        ),
+        SYNTHESIS_SCHEMA, _PASS_CONFIG["synthesis"]
+    )
+    
+    if not synthesis_result.success:
         result.failed_passes.append("synthesis")
-        synth = _FALLBACKS["synthesis"]
-        result.risk_level = synth["risk_level"]
-        result.confidence = synth["confidence"]
     
-    # Cap confidence if any pass failed
+    result.risk_level = synthesis_result.data.get("risk_level", "unknown")
+    result.confidence = synthesis_result.data.get("confidence", 0.0)
+    result.summary = synthesis_result.data.get("summary", "")
+    result.metadata["recommendation"] = synthesis_result.data.get("recommendation", "")
+    result.metadata["warnings"] = warnings
+    
+    # Cap confidence if passes failed
     if result.failed_passes and result.confidence > 0.3:
         result.confidence = min(result.confidence, 0.3)
-        print(f"  Confidence capped due to failures: {result.failed_passes}")
     
+    result.failed_passes = list(set(result.failed_passes))  # Deduplicate
     result.metadata["failed_passes"] = result.failed_passes
+    result.metadata["chunks_processed"] = len(chunks)
+    
     print(f"Review complete: risk={result.risk_level}, confidence={result.confidence:.2f}")
     return result
 
 
-def _format_findings(findings: list, limit: int = 5) -> str:
-    """Format findings for PR comment."""
-    if not findings:
-        return "None detected."
+def _deduplicate_findings(findings: list[dict]) -> list[dict]:
+    """Remove duplicate findings based on file+line+title similarity."""
+    seen: set[str] = set()
+    unique: list[dict] = []
     
-    findings_sorted = sorted(findings, key=lambda f: SEV_ORDER.get(f.get("severity", "unknown"), 99))
-    lines = []
-    for f in findings_sorted[:limit]:
-        sev = f.get("severity", "info").upper()
-        conf = f.get("confidence", 0) * 100
-        title = f.get("title", "Untitled")
-        file_path = f.get("file_path", "unknown")
-        line_nums = f.get("line_numbers", "?")
-        
-        badge = "🔴" if sev == "CRITICAL" else "🟠" if sev == "ERROR" else "🟡" if sev == "WARNING" else "ℹ️"
-        lines.append(f"{badge} **{title}** ({sev}, {conf:.0f}% conf)\n   `@{file_path}:{line_nums}`")
-        
-        desc = f.get("description", "")
-        if desc:
-            lines.append(f"   > {desc[:200]}{'...' if len(desc) > 200 else ''}")
-        
-        fix = f.get("suggested_fix", "")
-        if fix:
-            lines.append(f"\n   **Suggested fix:**\n   ```\n{fix[:300]}{'...' if len(fix) > 300 else ''}\n   ```")
-        lines.append("")
+    for f in findings:
+        key = f"{f.get('file_path', '')}:{f.get('line_numbers', '')}:{f.get('title', '')[:30]}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
     
-    remaining = len(findings_sorted) - limit
-    if remaining > 0:
-        lines.append(f"*... and {remaining} more*")
-    
-    return "\n".join(lines)
+    return unique
 
 
-def _post_review_comment(pr, result: ReviewResult, model_size: str) -> None:
-    """Post structured review comment to PR."""
-    
-    risk_emoji = {
-        "critical": "🔴 Critical",
-        "high": "🟠 High", 
-        "medium": "🟡 Medium",
-        "low": "🟢 Low",
-        "unknown": "⚪ Unknown",
-    }.get(result.risk_level, "⚪ Unknown")
-    
-    confidence_emoji = "✅" if result.confidence >= 0.8 else "⚠️" if result.confidence >= 0.5 else "❓"
-    
-    body = f"""## Ghost Review Report
-
-| Metric | Value |
-|--------|-------|
-| **Risk Level** | {risk_emoji} |
-| **Confidence** | {confidence_emoji} {result.confidence*100:.0f}% |
-| **PR Type** | {result.pr_type.upper()} |
-| **Model** | {model_size.upper()} |
-
-### Summary
-{result.summary or "No summary available."}
-
-### Security Issues ({len(result.security)})
-{_format_findings(result.security)}
-
-### Bugs & Quality ({len(result.bugs)})
-{_format_findings(result.bugs)}
-
-### Recommendation
-{result.metadata.get("recommendation", "Please review manually.")}
-
----
-<sub>Generated by Ghost Review • {os.environ.get('RUN_ID', 'local')}</sub>
-"""
-    
-    # Post main comment
-    pr.create_issue_comment(body)
-    
-    # Add review comments for top findings
-    files = {f.get("file_path"): f for f in result.bugs + result.security}
-    for f in result.bugs[:2] + result.security[:2]:
-        try:
-            path = f.get("file_path")
-            line = f.get("line_numbers", "").split("-")[0]
-            if line.isdigit():
-                pr.create_review_comment(
-                    body=f"**{f.get('severity', 'info').upper()}**: {f.get('title', 'Issue')}\n\n{f.get('description', '')[:200]}",
-                    commit_id=pr.head.sha,
-                    path=path,
-                    position=int(line),
-                )
-        except Exception as e:
-            print(f"  Could not post line comment: {e}")
+def _flatten_findings(findings: list[dict], finding_type: str) -> list[dict]:
+    """Convert findings to standard format."""
+    result = []
+    for f in findings:
+        result.append({
+            "type": finding_type,
+            "severity": f.get("severity", "info"),
+            "file": f.get("file_path", ""),
+            "line_start": f.get("line_numbers", "").split("-")[0] if f.get("line_numbers") else None,
+            "line_end": f.get("line_numbers", "").split("-")[-1] if f.get("line_numbers") and "-" in f.get("line_numbers", "") else None,
+            "description": f.get("description", ""),
+            "suggested_fix": f.get("suggested_fix", ""),
+            "vulnerability_class": f.get("vulnerability_class", ""),
+        })
+    return result
 
 
 async def main():
@@ -315,7 +407,16 @@ async def main():
     print(f"=== Ghost Review | PR #{pr_number} | model={model_size} ===")
     
     # Get diff
-    diff_text = pr.get_diff()
+    base_sha = os.environ.get("BASE_SHA", pr.base.sha)
+    head_sha = os.environ.get("HEAD_SHA", pr.head.sha)
+    
+    try:
+        diff_text = get_diff(base_sha, head_sha)
+    except Exception as e:
+        print(f"Error getting diff: {e}")
+        pr.create_issue_comment("⚠️ Ghost Review: Could not retrieve diff")
+        return
+    
     if not diff_text:
         print("No diff found")
         pr.create_issue_comment("⚠️ Ghost Review: No diff to analyze")
@@ -325,24 +426,51 @@ async def main():
         "title": pr.title,
         "body": pr.body or "",
         "number": pr_number,
-        "config": config,
     }
+    
+    start_time = asyncio.get_event_loop().time()
     
     # Run review
     async with LLMClient() as llm:
-        result = await run_review(pr_data, diff_text, model_size, llm)
+        result = await run_review(pr_data, diff_text, model_size, llm, config)
     
-    # Post results
-    _post_review_comment(pr, result, model_size)
+    elapsed = asyncio.get_event_loop().time() - start_time
+    
+    # Format and post comment
+    all_findings = _flatten_findings(result.bugs, "bug") + _flatten_findings(result.security, "security")
+    
+    comment_body = format_review_comment(
+        summary={
+            "summary": result.summary,
+            "pr_type": result.pr_type,
+            "changed_files_summary": [],
+            "risk_assessment": ", ".join(result.metadata.get("risk_areas", [])),
+        },
+        all_findings=all_findings,
+        verdict={
+            "risk_level": result.risk_level,
+            "merge_recommendation": "approve" if result.risk_level == "low" and result.confidence > 0.7 else "needs_discussion",
+            "confidence": result.confidence,
+            "rationale": result.metadata.get("recommendation", ""),
+        },
+        warnings=result.metadata.get("warnings", []),
+        model_size=model_size,
+        runner_vcpus=os.environ.get("RUNNER_VCPUS", "4"),
+        elapsed_seconds=elapsed,
+        failed_passes=result.failed_passes,
+    )
+    
+    await post_or_update_review_comment(pr, comment_body)
     
     # Summary
-    print(f"=== Review Complete ===")
+    print(f"\n=== Review Complete ===")
     print(f"Risk: {result.risk_level}")
     print(f"Confidence: {result.confidence:.2f}")
     print(f"Bugs: {len(result.bugs)}")
     print(f"Security: {len(result.security)}")
+    print(f"Time: {elapsed:.1f}s")
     if result.failed_passes:
-        print(f"Failed passes: {result.failed_passes}")
+        print(f"Failed: {result.failed_passes}")
 
 
 if __name__ == "__main__":

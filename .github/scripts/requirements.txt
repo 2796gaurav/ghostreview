@@ -4,3 +4,4 @@ tiktoken==0.7.0
 huggingface_hub==0.26.2
 hf_transfer==0.1.8
 pyyaml==6.0.2
+pyahocorasick==2.1.0
