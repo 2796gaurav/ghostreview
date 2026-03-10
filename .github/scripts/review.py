@@ -36,12 +36,12 @@ _MODEL_CONFIG = {
     "3b": {"max_diff_tokens": 10000, "context_reserve": 3000, "parallel_slots": 1},
 }
 
-# Pass timeouts and priorities
+# Pass timeouts and priorities (reduced to prevent hanging)
 _PASS_CONFIG = {
-    "summary":  {"timeout": 180.0, "priority": 1, "critical": True},
-    "bugs":     {"timeout": 240.0, "priority": 2, "critical": False},
-    "security": {"timeout": 180.0, "priority": 2, "critical": True},  # Run early if risk detected
-    "synthesis":{"timeout": 120.0, "priority": 3, "critical": True},
+    "summary":  {"timeout": 90.0, "priority": 1, "critical": True},   # Reduced from 180
+    "bugs":     {"timeout": 120.0, "priority": 2, "critical": False}, # Reduced from 240
+    "security": {"timeout": 90.0, "priority": 2, "critical": True},  # Reduced from 180
+    "synthesis":{"timeout": 60.0, "priority": 3, "critical": True},  # Reduced from 120
 }
 
 # Fallback values
@@ -430,9 +430,25 @@ async def main():
     
     start_time = asyncio.get_event_loop().time()
     
-    # Run review
-    async with LLMClient() as llm:
-        result = await run_review(pr_data, diff_text, model_size, llm, config)
+    # Run review with overall timeout guard
+    print("Starting review process...")
+    try:
+        async with LLMClient() as llm:
+            # Add overall timeout of 8 minutes to prevent indefinite hanging
+            result = await asyncio.wait_for(
+                run_review(pr_data, diff_text, model_size, llm, config),
+                timeout=480.0  # 8 minutes max total
+            )
+    except asyncio.TimeoutError:
+        print("ERROR: Review timed out after 8 minutes")
+        pr.create_issue_comment("⚠️ Ghost Review: Analysis timed out. The model may be overloaded.")
+        return
+    except Exception as e:
+        print(f"ERROR: Review failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        pr.create_issue_comment(f"⚠️ Ghost Review: Analysis failed with error: {str(e)[:200]}")
+        return
     
     elapsed = asyncio.get_event_loop().time() - start_time
     

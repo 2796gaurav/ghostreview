@@ -731,7 +731,18 @@ async def run_auto_fix() -> None:
     
     try:
         async with LLMClient() as llm:
-            result = await run_agentic_fix_with_reflection(issue_data, ".", config, llm)
+            # Add overall timeout of 10 minutes for auto-fix
+            result = await asyncio.wait_for(
+                run_agentic_fix_with_reflection(issue_data, ".", config, llm),
+                timeout=600.0  # 10 minutes max
+            )
+    except asyncio.TimeoutError:
+        print("ERROR: Auto-Fix timed out after 10 minutes")
+        result = FixResult(
+            gave_up=True,
+            reason="Auto-Fix timed out after 10 minutes. The model may be overloaded.",
+            errors_encountered=[{"type": "Timeout", "message": "Overall process timed out"}]
+        )
     except Exception as e:
         print(f"Critical error: {e}")
         import traceback

@@ -119,6 +119,7 @@ _start_server() {
     # New llama.cpp (b8252+) uses different flag syntax:
     # --flash-attn on (instead of just --flash-attn)
     # -fa is short form
+    # --timeout prevents hanging connections (seconds)
     "$LLAMA_SERVER_BIN" \
         --model              "$MODEL" \
         --host               127.0.0.1 \
@@ -132,6 +133,7 @@ _start_server() {
         --parallel           "$PARALLEL" \
         --keep               "$KEEP" \
         --cache-reuse        256 \
+        --timeout            120 \
         --flash-attn         on \
         --mlock \
         --no-mmap \
