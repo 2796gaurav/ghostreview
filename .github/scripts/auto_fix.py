@@ -309,10 +309,10 @@ Analyze this error and provide:
                 system=ERROR_ANALYSIS_PROMPT,
                 user=prompt,
                 schema=ERROR_ANALYSIS_SCHEMA,
-                max_tokens=4000,
+                max_tokens=2048,  # Reduced for ARM64 speed
                 temperature=0.2,
             ),
-            timeout=120.0,
+            timeout=300.0,  # 5 min for error analysis
         )
         return result
     except Exception as e:
@@ -457,10 +457,10 @@ Previous conversation context:
                     system=AGENT_SYSTEM_PROMPT,
                     user=context,
                     schema=AGENT_ACTION_SCHEMA,
-                    max_tokens=3500,
+                    max_tokens=2048,  # Reduced for ARM64 speed
                     temperature=0.2,
                 ),
-                timeout=200.0,
+                timeout=300.0,  # 5 min timeout per iteration
             )
         except asyncio.TimeoutError:
             print(f"  Timeout on iteration {iteration+1}")

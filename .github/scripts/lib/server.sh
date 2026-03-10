@@ -152,16 +152,18 @@ _start_server() {
 }
 
 # 4-vCPU ARM64 / 16 GB RAM / 7B model
+# Optimized for single-request performance (parallel=1)
+# n_predict=2048 is plenty for most responses (~400s max at 5 tok/s)
 start_server_4vcpu_7b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
-        65536 \
+        32768 \
         4 \
-        1024 \
         512 \
-        4096 \
-        2 \
-        1024
+        256 \
+        2048 \
+        1 \
+        512
     wait_for_server 90
 }
 
@@ -169,13 +171,13 @@ start_server_4vcpu_7b() {
 start_server_2vcpu_3b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-3b-instruct-q4_k_m.gguf" \
-        32768 \
+        16384 \
         2 \
-        512 \
         256 \
-        2048 \
+        128 \
+        1024 \
         1 \
-        768
+        256
     wait_for_server 60
 }
 
@@ -183,13 +185,13 @@ start_server_2vcpu_3b() {
 start_server_2vcpu_7b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
-        16384 \
+        8192 \
         2 \
-        512 \
         256 \
-        2048 \
+        128 \
+        1024 \
         1 \
-        1024
+        256
     wait_for_server 90
 }
 

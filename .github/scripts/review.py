@@ -36,12 +36,13 @@ _MODEL_CONFIG = {
     "3b": {"max_diff_tokens": 10000, "context_reserve": 3000, "parallel_slots": 1},
 }
 
-# Pass timeouts and priorities (reduced to prevent hanging)
+# Pass timeouts and priorities
+# At ~5 tok/s on ARM64: 1024 tokens needs ~200s + 30s overhead = 230s
 _PASS_CONFIG = {
-    "summary":  {"timeout": 90.0, "priority": 1, "critical": True},   # Reduced from 180
-    "bugs":     {"timeout": 120.0, "priority": 2, "critical": False}, # Reduced from 240
-    "security": {"timeout": 90.0, "priority": 2, "critical": True},  # Reduced from 180
-    "synthesis":{"timeout": 60.0, "priority": 3, "critical": True},  # Reduced from 120
+    "summary":  {"timeout": 120.0, "priority": 1, "critical": True},   # 512 tokens max
+    "bugs":     {"timeout": 240.0, "priority": 2, "critical": False}, # 1024 tokens max
+    "security": {"timeout": 240.0, "priority": 2, "critical": True},  # 1024 tokens max
+    "synthesis":{"timeout": 150.0, "priority": 3, "critical": True},  # 512 tokens max
 }
 
 # Fallback values
@@ -182,12 +183,16 @@ async def run_pass_with_retry(
     for attempt in range(max_retries + 1):
         start = asyncio.get_event_loop().time()
         try:
+            # Use smaller max_tokens for faster generation on ARM64
+            # At 5 tok/s: 1024 tokens = ~200s, 512 tokens = ~100s
+            max_tokens = 1024 if pass_name in ("bugs", "security") else 512
+            
             result = await asyncio.wait_for(
                 llm.chat(
                     system=system,
                     user=prompt,
                     schema=schema,
-                    max_tokens=4096 if pass_name in ("bugs", "security") else 2048,
+                    max_tokens=max_tokens,
                     temperature=0.1 if pass_name == "security" else 0.2,
                 ),
                 timeout=timeout,

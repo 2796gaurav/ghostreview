@@ -1,11 +1,7 @@
 """
 .github/scripts/llm_client.py
 
-Optimized async LLM client with:
-  - Shorter timeouts to prevent hanging
-  - Health check before requests
-  - Request/response logging for debugging
-  - Circuit breaker pattern for fault tolerance
+Optimized async LLM client with reasonable timeouts for ARM64 inference.
 """
 
 from __future__ import annotations
@@ -14,7 +10,6 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -24,48 +19,38 @@ class LLMError(Exception):
     """Raised when LLM server returns an error."""
 
 
-@dataclass
-class ServerEndpoint:
-    """Configuration for a single llama-server endpoint."""
-    url: str
-    weight: int = 1
-    healthy: bool = True
-    consecutive_failures: int = 0
-    last_used: float = field(default_factory=time.monotonic)
-    total_requests: int = 0
-    total_tokens: int = 0
-
-
 class LLMClient:
     """
-    Optimized async LLM client for llama-server.
+    Optimized async LLM client for llama-server on ARM64.
     
-    Uses shorter timeouts to prevent hanging and adds health checks.
+    ARM64 inference is slower (4-8 tok/s), so timeouts need to be
+    generous enough to allow completion but not so long that we hang.
     """
     
-    # Timeouts - shorter to prevent hanging
+    # Timeouts for ARM64 inference
+    # - Connect: quick, server should be ready
+    # - Read: needs to be long enough for slow ARM64 generation
+    # - Write: sending prompt is fast
     CONNECT_TIMEOUT = 10.0
-    READ_TIMEOUT = 60.0      # Reduced from 300s - max time per request
+    READ_TIMEOUT = 180.0      # 3 minutes - enough for ~1000 tokens at 5 tok/s
     WRITE_TIMEOUT = 10.0
     
     def __init__(self, base_url: str | None = None):
-        self.endpoints: list[ServerEndpoint] = []
+        self.endpoints: list[str] = []
         
         # Parse endpoints
         urls_env = os.environ.get("LLAMA_SERVER_URLS", "")
         if urls_env:
-            urls = [u.strip() for u in urls_env.split(",") if u.strip()]
-            for url in urls:
-                self.endpoints.append(ServerEndpoint(url=url.rstrip("/")))
+            self.endpoints = [u.strip().rstrip("/") for u in urls_env.split(",") if u.strip()]
         elif base_url:
-            self.endpoints.append(ServerEndpoint(url=base_url.rstrip("/")))
+            self.endpoints = [base_url.rstrip("/")]
         else:
             default = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
-            self.endpoints.append(ServerEndpoint(url=default.rstrip("/")))
+            self.endpoints = [default.rstrip("/")]
         
-        print(f"LLMClient initialized with endpoints: {[e.url for e in self.endpoints]}")
+        print(f"LLMClient: endpoints={self.endpoints}, read_timeout={self.READ_TIMEOUT}s")
         
-        # Initialize HTTP client with shorter timeouts
+        # Initialize HTTP client
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=self.CONNECT_TIMEOUT,
@@ -73,19 +58,18 @@ class LLMClient:
                 write=self.WRITE_TIMEOUT,
                 pool=5.0,
             ),
-            limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+            limits=httpx.Limits(max_connections=3, max_keepalive_connections=2),
         )
     
-    async def _health_check(self, endpoint: ServerEndpoint) -> bool:
+    async def _health_check(self, endpoint: str) -> bool:
         """Quick health check before making request."""
         try:
             response = await self._client.get(
-                f"{endpoint.url}/health",
+                f"{endpoint}/health",
                 timeout=5.0
             )
             return response.status_code == 200
-        except Exception as e:
-            print(f"  Health check failed for {endpoint.url}: {e}")
+        except Exception:
             return False
     
     async def chat(
@@ -93,16 +77,21 @@ class LLMClient:
         system: str,
         user: str,
         schema: dict[str, Any],
-        max_tokens: int = 1024,
+        max_tokens: int = 512,  # Reduced default for faster generation
         temperature: float = 0.1,
         top_p: float = 0.8,
         top_k: int = 20,
         repeat_penalty: float = 1.1,
-        max_retries: int = 2,
+        max_retries: int = 1,  # Reduced retries - if it fails once, likely to fail again
     ) -> dict[str, Any]:
         """
-        Send chat request with timeout and retry logic.
+        Send chat request with timeout appropriate for ARM64.
         """
+        # Estimate required time: ~5 tok/s on ARM64
+        # Add 30s overhead for prompt processing
+        estimated_time = 30.0 + (max_tokens / 5.0)
+        timeout = min(estimated_time, self.READ_TIMEOUT)
+        
         payload = {
             "model": "local",
             "messages": [
@@ -127,41 +116,29 @@ class LLMClient:
         }
         
         last_error = None
+        endpoint = self.endpoints[0]
         
         for attempt in range(max_retries + 1):
-            # Use first healthy endpoint or default to first
-            endpoint = self.endpoints[0]
-            
-            # Health check before request (on first attempt only)
+            # Health check on first attempt
             if attempt == 0:
-                print(f"  Checking server health...", end=" ")
-                if not await self._health_check(endpoint):
-                    print("UNHEALTHY")
-                    # Try to find healthy endpoint
-                    for ep in self.endpoints[1:]:
-                        if await self._health_check(ep):
-                            endpoint = ep
-                            print(f"Using alternative {endpoint.url}")
-                            break
-                    else:
-                        print("No healthy endpoints found, trying anyway...")
-                else:
-                    print("OK")
+                healthy = await self._health_check(endpoint)
+                print(f"  Health check: {'OK' if healthy else 'UNHEALTHY'}")
             
-            print(f"  Sending request (attempt {attempt + 1}/{max_retries + 1})...", end=" ")
+            print(f"  Request (attempt {attempt + 1}/{max_retries + 1}, timeout={timeout:.0f}s, max_tokens={max_tokens})...", end=" ", flush=True)
             t0 = time.monotonic()
             
             try:
                 response = await self._client.post(
-                    f"{endpoint.url}/v1/chat/completions",
+                    f"{endpoint}/v1/chat/completions",
                     json=payload,
+                    timeout=timeout,
                 )
                 
                 elapsed = time.monotonic() - t0
                 
                 if response.status_code != 200:
+                    print(f"FAILED HTTP {response.status_code}")
                     error_text = response.text[:200]
-                    print(f"FAILED ({response.status_code})")
                     raise LLMError(f"HTTP {response.status_code}: {error_text}")
                 
                 data = response.json()
@@ -179,7 +156,7 @@ class LLMClient:
                 completion_tokens = usage.get("completion_tokens", 0)
                 tok_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
                 
-                print(f"OK [{elapsed:.1f}s | {prompt_tokens}→{completion_tokens} tok | {tok_per_sec:.1f} tok/s]")
+                print(f"OK [{elapsed:.1f}s | {completion_tokens} tok | {tok_per_sec:.1f} tok/s]")
                 
                 try:
                     return json.loads(content)
@@ -189,16 +166,17 @@ class LLMClient:
             except httpx.ReadTimeout:
                 elapsed = time.monotonic() - t0
                 print(f"TIMEOUT after {elapsed:.1f}s")
-                last_error = LLMError(f"Request timed out after {elapsed:.1f}s")
+                last_error = LLMError(f"Request timed out after {elapsed:.1f}s (timeout={timeout}s)")
                 if attempt < max_retries:
-                    wait_time = 2 ** attempt
-                    print(f"  Retrying in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
+                    # Increase timeout for retry
+                    timeout = min(timeout * 1.5, self.READ_TIMEOUT)
+                    print(f"  Retrying with timeout={timeout:.0f}s...")
+                    await asyncio.sleep(1)
                 continue
                 
             except httpx.ConnectError as e:
                 print(f"CONNECT ERROR: {e}")
-                last_error = LLMError(f"Cannot connect to {endpoint.url}: {e}")
+                last_error = LLMError(f"Cannot connect to {endpoint}: {e}")
                 if attempt < max_retries:
                     await asyncio.sleep(2)
                 continue
@@ -218,9 +196,9 @@ class LLMClient:
         user: str,
         schema: dict[str, Any],
         fallback_value: dict[str, Any],
-        max_tokens: int = 1024,
+        max_tokens: int = 512,
         temperature: float = 0.1,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 180.0,
         **kwargs: Any,
     ) -> tuple[dict[str, Any], bool]:
         """
