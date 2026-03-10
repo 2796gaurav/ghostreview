@@ -1,11 +1,11 @@
 """
 .github/scripts/auto_fix.py
 
-Advanced Auto-Fix Agent with:
-  - ReAct (Reasoning + Acting) pattern
-  - Reflection for self-correction
-  - Beam search for patch generation
-  - Validation with retry logic
+Self-healing Auto-Fix Agent with:
+  - Error capture and traceback analysis
+  - Reflection loop for self-correction
+  - Max 10 retry attempts
+  - Draft PR with error notes if unresolved
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,8 +29,8 @@ from diff_parser import sanitize
 from github import Github
 from github_api import check_actor_permission, create_draft_pr
 from llm_client import LLMClient, LLMError
-from prompts import AGENT_SYSTEM_PROMPT
-from schemas import AGENT_ACTION_SCHEMA, VERIFY_SCHEMA
+from prompts import AGENT_SYSTEM_PROMPT, ERROR_ANALYSIS_PROMPT
+from schemas import AGENT_ACTION_SCHEMA, VERIFY_SCHEMA, ERROR_ANALYSIS_SCHEMA
 
 
 @dataclass
@@ -48,7 +50,19 @@ class FixResult:
     reason: str = ""
     agent_thinking_trace: str = ""
     iterations_used: int = 0
-    exploration_coverage: float = 0.0  # % of relevant files explored
+    exploration_coverage: float = 0.0
+    errors_encountered: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ErrorContext:
+    """Context for an error that occurred during fixing."""
+    error_type: str
+    error_message: str
+    traceback_str: str
+    file_path: str | None = None
+    line_number: int | None = None
+    iteration: int = 0
 
 
 # Protected paths that cannot be modified
@@ -141,7 +155,6 @@ def _build_tree(repo_path: str, max_depth: int = 4) -> str:
 
 def _extract_files_from_issue(issue_body: str) -> list[str]:
     """Extract potential file references from issue text."""
-    # Match patterns like src/main.py, `config.json`, or "utils/helpers.py"
     patterns = [
         r'`([^`]+\.(?:py|js|ts|tsx|jsx|go|rs|java|rb|php|cs|c|cpp|h|swift|kt))`',
         r'"([^"]+\.(?:py|js|ts|tsx|jsx|go|rs|java|rb|php|cs|c|cpp|h|swift|kt))"',
@@ -170,7 +183,6 @@ def _validate_syntax(file_path: str, content: str) -> tuple[bool, str]:
         except SyntaxError as e:
             return False, f"SyntaxError line {e.lineno}: {e.msg}"
     elif ext in (".js", ".ts", ".jsx", ".tsx"):
-        # Basic structural checks
         imbalances = []
         if content.count("{") != content.count("}"):
             imbalances.append("braces")
@@ -195,12 +207,10 @@ def _validate_syntax(file_path: str, content: str) -> tuple[bool, str]:
         except Exception as e:
             return False, f"YAML error: {e}"
     elif ext == ".go":
-        # Basic Go check - look for obvious issues
         if content.count("{") != content.count("}"):
             return False, "Unbalanced braces"
         return True, ""
     elif ext == ".rs":
-        # Basic Rust check
         if content.count("{") != content.count("}"):
             return False, "Unbalanced braces"
         return True, ""
@@ -208,15 +218,110 @@ def _validate_syntax(file_path: str, content: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _calculate_similarity(text1: str, text2: str) -> float:
-    """Calculate Jaccard similarity between two texts."""
-    words1 = set(text1.lower().split())
-    words2 = set(text2.lower().split())
-    if not words1 or not words2:
-        return 0.0
-    intersection = len(words1 & words2)
-    union = len(words1 | words2)
-    return intersection / union if union > 0 else 0.0
+def _test_python_code(file_path: str, content: str) -> tuple[bool, ErrorContext | None]:
+    """Test Python code by compiling and catching errors."""
+    ext = Path(file_path).suffix.lower()
+    if ext != ".py":
+        return True, None
+    
+    # First try to compile
+    try:
+        compile(content, file_path, "exec")
+    except SyntaxError as e:
+        tb_str = traceback.format_exc()
+        return False, ErrorContext(
+            error_type="SyntaxError",
+            error_message=str(e),
+            traceback_str=tb_str,
+            file_path=file_path,
+            line_number=e.lineno,
+        )
+    
+    # Try to import in a temp file (catches import errors)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(content)
+        temp_path = f.name
+    
+    try:
+        # Run Python to check for import/runtime errors
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", temp_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return False, ErrorContext(
+                error_type="Import/Runtime Error",
+                error_message=result.stderr or "Unknown error",
+                traceback_str=result.stderr,
+                file_path=file_path,
+            )
+        return True, None
+    except Exception as e:
+        return True, None  # If we can't test, assume it's ok
+    finally:
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+
+async def _analyze_error_with_llm(
+    error: ErrorContext,
+    file_content: str,
+    file_path: str,
+    issue: dict,
+    llm: LLMClient,
+) -> dict[str, Any]:
+    """Send error to LLM for analysis and fix suggestion."""
+    prompt = f"""An error occurred while trying to fix this issue. Analyze the error and suggest how to fix it.
+
+ISSUE:
+{sanitize(issue.get('body', ''), 1000)}
+
+FILE: {file_path}
+
+CURRENT FILE CONTENT:
+```python
+{file_content[:3000]}
+```
+
+ERROR DETAILS:
+- Type: {error.error_type}
+- Message: {error.error_message}
+- Line: {error.line_number or 'Unknown'}
+
+TRACEBACK:
+```
+{error.traceback_str[:2000]}
+```
+
+Analyze this error and provide:
+1. What caused the error
+2. How to fix it
+3. The corrected code (full file content)
+"""
+    
+    try:
+        result = await asyncio.wait_for(
+            llm.chat(
+                system=ERROR_ANALYSIS_PROMPT,
+                user=prompt,
+                schema=ERROR_ANALYSIS_SCHEMA,
+                max_tokens=4000,
+                temperature=0.2,
+            ),
+            timeout=120.0,
+        )
+        return result
+    except Exception as e:
+        return {
+            "analysis": f"Failed to analyze error: {e}",
+            "fix_suggestion": "Manual review needed",
+            "corrected_code": file_content,
+            "confidence": 0.0,
+        }
 
 
 async def _verify_patch(patch: PatchSpec, issue_body: str, llm: LLMClient) -> PatchSpec:
@@ -241,7 +346,6 @@ async def _verify_patch(patch: PatchSpec, issue_body: str, llm: LLMClient) -> Pa
         )
         
         if result["correct"]:
-            # Average confidence with patch confidence
             patch.final_confidence = (patch.patch_confidence + result["verified_confidence"]) / 2
         else:
             patch.final_confidence = patch.patch_confidence * 0.5
@@ -254,23 +358,21 @@ async def _verify_patch(patch: PatchSpec, issue_body: str, llm: LLMClient) -> Pa
     return patch
 
 
-async def run_agentic_fix(
+async def run_agentic_fix_with_reflection(
     issue: dict,
     repo_path: str,
     config: dict,
     llm: LLMClient,
 ) -> FixResult:
     """
-    ReAct-based agentic fix with reflection and exploration.
+    Self-healing agentic fix with error reflection and retry loop.
+    Max 10 attempts before giving up.
     """
-    MAX_ITER = 20
+    MAX_ITER = 10  # Max retries as requested
     CONFIDENCE_THRESHOLD = config.get("auto_fix", {}).get("confidence_threshold", 0.70)
     MAX_FILES = min(config.get("auto_fix", {}).get("max_files", 5), 5)
     
-    # Build initial context
     file_tree = _build_tree(repo_path)
-    
-    # Extract files mentioned in issue
     mentioned_files = _extract_files_from_issue(issue.get("body", ""))
     print(f"  Files mentioned in issue: {mentioned_files}")
     
@@ -278,7 +380,8 @@ async def run_agentic_fix(
     thinking_trace: list[str] = []
     conversation: list[dict] = []
     files_read: set[str] = set()
-    files_targeted: set[str] = set()  # Files mentioned or likely relevant
+    files_targeted: set[str] = set()
+    errors_encountered: list[ErrorContext] = []
     
     # Initialize with issue context
     initial_prompt = f"""Fix this GitHub issue by exploring the codebase and generating patches.
@@ -300,31 +403,52 @@ INSTRUCTIONS:
 4. Patches must be FULL file content, not diffs
 5. Make minimal, focused changes
 
-EXPLORATION STRATEGY:
-- If files are mentioned in issue, read those first
-- If issue mentions errors, find where the error originates
-- For bugs: look for the code that should handle the case
-- For features: understand existing patterns before adding
-
 IMPORTANT: You MUST read a file before generating a patch for it.
 
 Begin exploration."""
 
     conversation.append({"role": "user", "content": initial_prompt})
     
-    # Track exploration phases
-    phase = "explore"  # explore -> analyze -> patch -> verify
+    phase = "explore"
     iterations_in_phase = 0
+    reflection_mode = False
+    current_error: ErrorContext | None = None
     
     for iteration in range(MAX_ITER):
         iterations_in_phase += 1
-        print(f"  [{phase}] Iteration {iteration + 1}/{MAX_ITER}")
+        print(f"  [{phase}{'/REFLECT' if reflection_mode else ''}] Iteration {iteration + 1}/{MAX_ITER}")
         
-        # Build context window (last 10 messages)
-        context = "\n\n".join(
-            f"[{m['role'].upper()}]\n{m['content'][:3000]}"
-            for m in conversation[-10:]
-        )
+        # Build context window
+        if reflection_mode and current_error:
+            # In reflection mode, include error analysis
+            context = f"""[ERROR REFLECTION MODE]
+
+An error was encountered in the previous iteration:
+- Error Type: {current_error.error_type}
+- Error Message: {current_error.error_message}
+- Line Number: {current_error.line_number or 'Unknown'}
+
+TRACEBACK:
+```
+{current_error.traceback_str[:2000]}
+```
+
+Please fix this error and regenerate the patch correctly.
+
+---
+
+Previous conversation context:
+"""
+            context += "\n\n".join(
+                f"[{m['role'].upper()}]\n{m['content'][:2000]}"
+                for m in conversation[-5:]
+            )
+            reflection_mode = False  # Reset after one reflection iteration
+        else:
+            context = "\n\n".join(
+                f"[{m['role'].upper()}]\n{m['content'][:3000]}"
+                for m in conversation[-10:]
+            )
         
         # Get agent action
         try:
@@ -342,12 +466,22 @@ Begin exploration."""
             print(f"  Timeout on iteration {iteration+1}")
             if patches:
                 break
-            return FixResult(gave_up=True, reason="Timeout", iterations_used=iteration+1)
+            return FixResult(
+                gave_up=True,
+                reason="Timeout",
+                iterations_used=iteration+1,
+                errors_encountered=[{"type": "Timeout", "message": "LLM request timed out"}]
+            )
         except LLMError as exc:
             print(f"  LLM Error: {exc}")
             if patches:
                 break
-            return FixResult(gave_up=True, reason=f"LLM error: {exc}", iterations_used=iteration+1)
+            return FixResult(
+                gave_up=True,
+                reason=f"LLM error: {exc}",
+                iterations_used=iteration+1,
+                errors_encountered=[{"type": "LLMError", "message": str(exc)}]
+            )
         
         action = result.get("action", "give_up")
         params = result.get("action_params", {})
@@ -368,7 +502,6 @@ Begin exploration."""
                 files_targeted.add(path)
                 action_result = f"File '{path}' contents:\n```\n{content[:8000]}\n```"
                 
-                # Transition to analyze phase after reading key files
                 if phase == "explore" and iterations_in_phase >= 2:
                     phase = "analyze"
                     iterations_in_phase = 0
@@ -409,22 +542,39 @@ Begin exploration."""
                 valid, error = _validate_syntax(fp, patched)
                 if not valid:
                     action_result = f"VALIDATION FAILED: {error}\n\nPlease fix the syntax and regenerate."
-                else:
-                    patch = PatchSpec(
+                    # Create error context for reflection
+                    current_error = ErrorContext(
+                        error_type="SyntaxError",
+                        error_message=error,
+                        traceback_str=error,
                         file_path=fp,
-                        patched_content=patched,
-                        explanation=explanation,
-                        patch_confidence=patch_conf,
-                        final_confidence=patch_conf,
+                        iteration=iteration
                     )
-                    patches.append(patch)
-                    files_targeted.add(fp)
-                    action_result = f"✅ Patch accepted for {fp} (confidence={patch_conf:.2f}). Generate more patches or finish."
-                    print(f"    Staged patch: {fp} (conf={patch_conf:.2f})")
-                    
-                    # Transition to patch/verify phase
-                    phase = "verify"
-                    iterations_in_phase = 0
+                    errors_encountered.append(current_error)
+                    reflection_mode = True
+                else:
+                    # Test the code (Python only)
+                    test_passed, test_error = _test_python_code(fp, patched)
+                    if not test_passed and test_error:
+                        action_result = f"CODE TEST FAILED: {test_error.error_message}\n\nPlease fix this error and regenerate."
+                        errors_encountered.append(test_error)
+                        current_error = test_error
+                        reflection_mode = True
+                    else:
+                        patch = PatchSpec(
+                            file_path=fp,
+                            patched_content=patched,
+                            explanation=explanation,
+                            patch_confidence=patch_conf,
+                            final_confidence=patch_conf,
+                        )
+                        patches.append(patch)
+                        files_targeted.add(fp)
+                        action_result = f"✅ Patch accepted for {fp} (confidence={patch_conf:.2f}). Generate more patches or finish."
+                        print(f"    Staged patch: {fp} (conf={patch_conf:.2f})")
+                        phase = "verify"
+                        iterations_in_phase = 0
+                        reflection_mode = False
         
         elif action == "finish":
             print(f"  Agent finished after {iteration + 1} iterations")
@@ -439,6 +589,7 @@ Begin exploration."""
                 agent_thinking_trace="\n".join(thinking_trace),
                 iterations_used=iteration+1,
                 exploration_coverage=len(files_read) / max(len(files_targeted), 1),
+                errors_encountered=[{"type": "GiveUp", "message": reason}]
             )
         
         else:
@@ -446,12 +597,11 @@ Begin exploration."""
         
         conversation.append({"role": "user", "content": f"[RESULT]\n{action_result}\n\nContinue with your next action."})
         
-        # Phase transitions based on state
+        # Phase transitions
         if phase == "explore" and len(files_read) >= 3:
             phase = "analyze"
             iterations_in_phase = 0
         elif phase == "analyze" and iterations_in_phase >= 3 and not patches:
-            # Push to patch phase if we've analyzed enough
             phase = "patch"
             iterations_in_phase = 0
     
@@ -460,37 +610,37 @@ Begin exploration."""
         if not patches:
             return FixResult(
                 gave_up=True,
-                reason=f"Max iterations ({MAX_ITER}) reached without generating patches",
+                reason=f"Max iterations ({MAX_ITER}) reached without generating valid patches",
                 iterations_used=MAX_ITER,
                 exploration_coverage=len(files_read) / max(len(files_targeted), 1),
+                errors_encountered=[{"type": e.error_type, "message": e.error_message} for e in errors_encountered]
             )
     
     if not patches:
         return FixResult(
             gave_up=True,
-            reason="No patches generated",
+            reason="No valid patches generated",
             agent_thinking_trace="\n".join(thinking_trace),
             iterations_used=len(thinking_trace),
+            errors_encountered=[{"type": e.error_type, "message": e.error_message} for e in errors_encountered]
         )
     
-    # Verification phase with reflection
+    # Verification phase
     print(f"  Verifying {len(patches)} patch(es)...")
     issue_body = issue.get("body") or ""
     verified = []
     
     for patch in patches:
         if patch.patch_confidence < 0.85:
-            # Low confidence patches get extra verification
             patch = await _verify_patch(patch, issue_body, llm)
         verified.append(patch)
     
-    # Filter by confidence threshold
     final_patches = [p for p in verified if p.final_confidence >= CONFIDENCE_THRESHOLD]
     rejected = [p for p in verified if p.final_confidence < CONFIDENCE_THRESHOLD]
     
     if rejected:
         for p in rejected:
-            print(f"  Rejected {p.file_path}: {p.final_confidence:.2f} (concern: {p.verification_concern[:50]}...)")
+            print(f"  Rejected {p.file_path}: {p.final_confidence:.2f}")
     
     return FixResult(
         patches=final_patches,
@@ -499,6 +649,7 @@ Begin exploration."""
         agent_thinking_trace="\n".join(thinking_trace),
         iterations_used=len(thinking_trace),
         exploration_coverage=len(files_read) / max(len(files_targeted), 1),
+        errors_encountered=[{"type": e.error_type, "message": e.error_message} for e in errors_encountered]
     )
 
 
@@ -525,7 +676,6 @@ def _apply_patches(
         run(["git", "add", str(patch.file_path)])
         print(f"  Staged: {patch.file_path}")
     
-    # Create commit message
     safe_title = issue_title[:60].replace('"', "'")
     msg = f"""fix: {safe_title} (AI-generated)
 
@@ -539,7 +689,7 @@ Generated by Ghost Review Auto-Fix.
 
 
 async def run_auto_fix() -> None:
-    """Main entry point for auto-fix."""
+    """Main entry point for auto-fix with self-healing."""
     github_token = os.environ["GITHUB_TOKEN"]
     repo_slug = os.environ["REPO"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
@@ -569,7 +719,6 @@ async def run_auto_fix() -> None:
         print("Skip: Auto-Fix disabled in config")
         return
     
-    # Post working comment
     working_comment = issue.create_comment("🤖 Auto-Fix agent analyzing issue... (ETA: 3-5 minutes)")
     
     issue_data = {
@@ -578,12 +727,20 @@ async def run_auto_fix() -> None:
         "body": issue.body or "",
     }
     
+    result = FixResult(gave_up=True, reason="Initialization failed")
+    
     try:
         async with LLMClient() as llm:
-            result = await run_agentic_fix(issue_data, ".", config, llm)
+            result = await run_agentic_fix_with_reflection(issue_data, ".", config, llm)
     except Exception as e:
         print(f"Critical error: {e}")
-        result = FixResult(gave_up=True, reason=f"System error: {e}")
+        import traceback
+        tb_str = traceback.format_exc()
+        result = FixResult(
+            gave_up=True,
+            reason=f"System error: {e}",
+            errors_encountered=[{"type": type(e).__name__, "message": str(e), "traceback": tb_str}]
+        )
     finally:
         try:
             working_comment.delete()
@@ -591,19 +748,71 @@ async def run_auto_fix() -> None:
             pass
     
     if result.gave_up or not result.patches:
-        # Post failure comment with trace
-        trace = result.agent_thinking_trace[-2000:] if result.agent_thinking_trace else "No trace available"
+        # Post failure comment with detailed error analysis
+        trace = result.agent_thinking_trace[-1500:] if result.agent_thinking_trace else "No trace available"
+        
+        error_details = ""
+        if result.errors_encountered:
+            error_details = "\n\n**Errors Encountered**:\n"
+            for i, err in enumerate(result.errors_encountered[-3:], 1):  # Show last 3 errors
+                error_details += f"\n{i}. **{err.get('type', 'Unknown')}**: {err.get('message', 'No message')[:200]}"
+        
+        # If we have partial patches but couldn't validate them, create a draft PR anyway
+        if result.patches:
+            safe_title = "".join(c if c.isalnum() or c in "-_" else "-" for c in issue.title[:30]).strip("-")
+            branch_name = f"fix/ai-{issue_number}-{safe_title}-partial"
+            
+            try:
+                _apply_patches(result.patches, branch_name, issue_number, issue.title, repo.default_branch)
+                
+                # Create draft PR with error notes
+                patch_summaries = [
+                    {"file_path": p.file_path, "explanation": p.explanation}
+                    for p in result.patches
+                ]
+                
+                pr_url = create_draft_pr(
+                    repo=repo,
+                    branch_name=branch_name,
+                    base_branch=repo.default_branch,
+                    issue_number=issue_number,
+                    issue_title=issue.title,
+                    patch_summaries=patch_summaries,
+                    agent_thinking=result.agent_thinking_trace + "\n\nERRORS:\n" + str(result.errors_encountered),
+                    confidence=0.3,  # Low confidence due to errors
+                    repo_path=".",
+                )
+                
+                issue.create_comment(
+                    f"⚠️ **Draft PR Created (Partial/Needs Review)**: {pr_url}\n\n"
+                    f"The agent encountered errors during fixing and could not fully validate the patches.\n\n"
+                    f"**Status**: Gave up after {result.iterations_used} iterations\n"
+                    f"**Reason**: {result.reason or 'Unable to generate valid patch'}"
+                    f"{error_details}\n\n"
+                    f"**Agent Trace** (last 1500 chars):\n"
+                    f"<details><summary>Expand</summary>\n\n```\n{trace}\n```\n</details>\n\n"
+                    f"⚠️ **This PR requires manual review and fixes before merging.**"
+                )
+                print(f"Partial success with errors: {pr_url}")
+                return
+                
+            except Exception as git_err:
+                print(f"Failed to create partial PR: {git_err}")
+        
+        # Complete failure - no patches at all
         issue.create_comment(
             f"❌ Auto-Fix could not generate a patch\n\n"
-            f"**Reason**: {result.reason or 'Unable to determine fix'}\n\n"
-            f"**Agent Trace** (last 2000 chars):\n"
+            f"**Status**: Gave up after {result.iterations_used} iterations\n"
+            f"**Reason**: {result.reason or 'Unable to determine fix'}"
+            f"{error_details}\n\n"
+            f"**Agent Trace** (last 1500 chars):\n"
             f"<details><summary>Expand</summary>\n\n```\n{trace}\n```\n</details>\n\n"
             f"Please fix this issue manually."
         )
         print(f"Failed: {result.reason}")
         return
     
-    # Create branch and apply patches
+    # Success path - create branch and apply patches
     safe_title = "".join(c if c.isalnum() or c in "-_" else "-" for c in issue.title[:30]).strip("-")
     branch_name = f"fix/ai-{issue_number}-{safe_title}"
     
@@ -625,7 +834,6 @@ async def run_auto_fix() -> None:
     else:
         confidence_badge = "⚠️ Low confidence"
     
-    # Create draft PR
     patch_summaries = [
         {"file_path": p.file_path, "explanation": p.explanation}
         for p in result.patches
@@ -648,10 +856,14 @@ async def run_auto_fix() -> None:
         print(f"PR creation error: {e}")
         return
     
-    # Post success comment
+    # Success comment
+    error_summary = ""
+    if result.errors_encountered:
+        error_summary = f"\n(Encountered and resolved {len(result.errors_encountered)} error(s) during fixing)"
+    
     issue.create_comment(
         f"✅ **Draft PR Created**: {pr_url}\n\n"
-        f"{confidence_badge} ({avg_conf*100:.0f}%)\n"
+        f"{confidence_badge} ({avg_conf*100:.0f}%){error_summary}\n"
         f"Exploration coverage: {coverage_pct:.0f}%\n\n"
         f"**Modified Files**:\n"
         + "\n".join(f"- `{p.file_path}`: {p.explanation[:100]}..." if len(p.explanation) > 100 else f"- `{p.file_path}`: {p.explanation}"

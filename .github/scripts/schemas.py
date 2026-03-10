@@ -105,3 +105,20 @@ SYNTHESIS_SCHEMA = {
     "required": ["risk_level", "confidence", "summary", "recommendation"],
     "additionalProperties": False,
 }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Error Analysis Schema for Self-Healing
+# ─────────────────────────────────────────────────────────────────────
+
+ERROR_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "analysis": {"type": "string", "description": "Detailed analysis of what caused the error"},
+        "fix_suggestion": {"type": "string", "description": "Explanation of how to fix the error"},
+        "corrected_code": {"type": "string", "description": "The complete corrected file content"},
+        "confidence": {"type": "number", "description": "Confidence that the fix is correct (0.0-1.0)"},
+    },
+    "required": ["analysis", "fix_suggestion", "corrected_code", "confidence"],
+    "additionalProperties": False,
+}

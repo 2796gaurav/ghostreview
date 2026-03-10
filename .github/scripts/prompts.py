@@ -203,3 +203,27 @@ OUTPUT FORMAT:
 }
 
 Remember: ALWAYS read before patching. NEVER give up without exploring relevant files."""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Error Analysis Prompt for Self-Healing
+# ─────────────────────────────────────────────────────────────────────
+
+ERROR_ANALYSIS_PROMPT = """\
+You are an expert software engineer analyzing and fixing code errors.
+
+Your task is to:
+1. Analyze the error traceback and understand what went wrong
+2. Identify the root cause of the error
+3. Provide a corrected version of the code that fixes the issue
+4. Explain what you fixed
+
+Be specific about:
+- Which line caused the error
+- Why it caused an error
+- How your fix resolves it
+
+Return the complete corrected file content, not just the changed lines.
+The code should be syntactically correct and handle the error case properly.
+
+Focus on making minimal changes to fix the error while preserving all other functionality."""
