@@ -32,7 +32,6 @@ jobs:
     timeout-minutes: 25
 
     env:
-      LLAMA_CPP_VERSION:   "b8252"
       MODEL_SIZE_OVERRIDE: ""
 
     steps:
@@ -74,13 +73,6 @@ jobs:
         run: |
           git config user.name  "GhostReview[bot]"
           git config user.email "ghost-review-bot@users.noreply.github.com"
-
-      - name: Cache llama.cpp binary
-        if: steps.perms.outputs.allowed == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ghost-review/llama-bin
-          key: ghost-review-llama-${{ runner.os }}-${{ runner.arch }}-${{ env.LLAMA_CPP_VERSION }}
 
       - name: Cache LLM models
         if: steps.perms.outputs.allowed == 'true'

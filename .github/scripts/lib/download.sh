@@ -5,61 +5,60 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────
-# Download llama.cpp pre-built binary
+# Install llama-cpp-python with server support
+# This provides llama-server binary via pip wheels (better ARM64 support)
 # ──────────────────────────────────────────────────────────────────────
 download_llama_cpp_if_needed() {
     local BINDIR="$HOME/.cache/ghost-review/llama-bin"
-    local BINARY="$BINDIR/llama-server"
-    local VERSION="${LLAMA_CPP_VERSION:-b8252}"
+    mkdir -p "$BINDIR"
 
-    if [[ -f "$BINARY" ]]; then
-        echo "llama-server cached: $(${BINARY} --version 2>&1 | head -1 || echo 'version unknown')"
+    # Check if we already have it in cache
+    if [[ -f "$BINDIR/llama-server" ]]; then
+        echo "llama-server cached: $(${BINDIR}/llama-server --version 2>&1 | head -1 || echo 'version unknown')"
         return 0
     fi
 
-    echo "Downloading llama.cpp ${VERSION}..."
-    mkdir -p "$BINDIR"
-
-    local ARCH
-    ARCH=$(uname -m)
-    local URL
-
-    if [[ "$ARCH" == "aarch64" ]]; then
-        URL="https://github.com/ggml-org/llama.cpp/releases/download/${VERSION}/llama-${VERSION}-bin-ubuntu-arm64.zip"
-    else
-        URL="https://github.com/ggml-org/llama.cpp/releases/download/${VERSION}/llama-${VERSION}-bin-ubuntu-x64.zip"
-    fi
-
-    echo "URL: ${URL}"
-
-    # Download and extract
-    wget -q --show-progress "$URL" -O /tmp/llama.zip 2>&1 || {
-        echo "ERROR: Failed to download llama.cpp binary from ${URL}"
+    echo "Installing llama-cpp-python with server support..."
+    
+    # Install llama-cpp-python with server support
+    # This downloads pre-built wheels when available
+    pip install -q "llama-cpp-python[server]>=0.3.0" --no-cache-dir 2>&1 | tail -5 || {
+        echo "ERROR: Failed to install llama-cpp-python"
         exit 1
     }
 
-    unzip -q /tmp/llama.zip -d "$BINDIR/"
-    chmod +x "$BINDIR"/llama-server* 2>/dev/null || true
-
-    # Handle different zip structures
-    if [[ -f "$BINDIR/llama-server" ]]; then
+    # Find the installed llama-server binary
+    local SERVER_BIN
+    SERVER_BIN=$(python3 -c "import llama_cpp.server; print(llama_cpp.server.__file__)" 2>/dev/null | xargs dirname | xargs -I{} dirname)/bin/llama-server || true
+    
+    if [[ -z "$SERVER_BIN" ]] || [[ ! -f "$SERVER_BIN" ]]; then
+        # Try to find it in PATH
+        SERVER_BIN=$(which llama-server 2>/dev/null || true)
+    fi
+    
+    if [[ -z "$SERVER_BIN" ]] || [[ ! -f "$SERVER_BIN" ]]; then
+        # Try alternative: python -m llama_cpp.server
+        echo "Creating llama-server wrapper..."
+        cat > "$BINDIR/llama-server" << 'EOF'
+#!/usr/bin/env bash
+# Wrapper for llama-cpp-python server
+exec python3 -m llama_cpp.server "$@"
+EOF
         chmod +x "$BINDIR/llama-server"
-    elif [[ -f "$BINDIR/build/bin/llama-server" ]]; then
-        ln -sf "$BINDIR/build/bin/llama-server" "$BINDIR/llama-server"
     else
-        # Find llama-server binary
-        local FOUND
-        FOUND=$(find "$BINDIR" -name "llama-server" -type f | head -1)
-        if [[ -n "$FOUND" ]]; then
-            ln -sf "$FOUND" "$BINDIR/llama-server"
-        else
-            echo "ERROR: llama-server binary not found in extracted archive"
-            exit 1
-        fi
+        cp "$SERVER_BIN" "$BINDIR/llama-server"
+        chmod +x "$BINDIR/llama-server"
     fi
 
-    rm -f /tmp/llama.zip
-    echo "llama-server installed: ${BINDIR}/llama-server"
+    # Add to PATH for this session
+    export PATH="$BINDIR:$PATH"
+    
+    # Verify installation
+    if "$BINDIR/llama-server" --version 2>&1 | head -1; then
+        echo "llama-server installed successfully"
+    else
+        echo "WARNING: llama-server may not work correctly"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -77,7 +76,7 @@ download_models_if_needed() {
 
     # Download 7B model
     if [[ ! -f "$DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" ]]; then
-        echo "Downloading Qwen2.5-Coder-7B Q4_K_M..."
+        echo "Downloading Qwen2.5-Coder-7B Q4_K_M (~4.7 GB)..."
         HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
             Qwen/Qwen2.5-Coder-7B-Instruct-GGUF \
             --include "qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
@@ -92,7 +91,7 @@ download_models_if_needed() {
 
     # Download 3B fallback model
     if [[ ! -f "$DIR/qwen2.5-coder-3b-instruct-q4_k_m.gguf" ]]; then
-        echo "Downloading Qwen2.5-Coder-3B Q4_K_M (fallback)..."
+        echo "Downloading Qwen2.5-Coder-3B Q4_K_M (~2.3 GB)..."
         HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
             Qwen/Qwen2.5-Coder-3B-Instruct-GGUF \
             --include "qwen2.5-coder-3b-instruct-q4_k_m.gguf" \

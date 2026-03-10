@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # .github/scripts/lib/server.sh
 # llama-server startup functions for each runner/model configuration.
-# Every flag is documented. None are blindly applied defaults.
 
 set -euo pipefail
 
-LLAMA_SERVER_BIN="$HOME/.cache/ghost-review/llama-bin/llama-server"
+# llama-server is installed via pip in llama-cpp-python
+LLAMA_SERVER_BIN="${HOME}/.cache/ghost-review/llama-bin/llama-server"
 MODEL_DIR="$HOME/.cache/ghost-review/models"
 LLAMA_PID_FILE="/tmp/ghost-review-llama.pid"
 LLAMA_LOG_FILE="/tmp/ghost-review-llama.log"
+
+# Ensure llama-server is in PATH
+export PATH="${HOME}/.cache/ghost-review/llama-bin:$PATH"
 
 # ──────────────────────────────────────────────────────────────────────
 # wait_for_server — poll /health until 200 OK or timeout
@@ -70,6 +73,15 @@ _start_server() {
     echo "  Parallel   : ${PARALLEL} slots"
     echo "  KV keep    : ${KEEP} tokens"
 
+    # Use llama-server from pip package
+    if command -v llama-server &> /dev/null; then
+        LLAMA_SERVER_BIN=$(which llama-server)
+    elif [[ ! -f "$LLAMA_SERVER_BIN" ]]; then
+        echo "ERROR: llama-server not found. Installing..."
+        pip install -q "llama-cpp-python[server]>=0.3.0"
+        LLAMA_SERVER_BIN=$(which llama-server)
+    fi
+
     "$LLAMA_SERVER_BIN" \
         --model              "$MODEL" \
         --host               127.0.0.1 \
@@ -105,9 +117,6 @@ _start_server() {
 # ──────────────────────────────────────────────────────────────────────
 
 # 4-vCPU ARM64 / 16 GB RAM / 7B model
-# Context  : 65536 (uses KV shift within native 32K window)
-# Parallel : 2 (passes 2+3 run concurrently via asyncio.gather)
-# Keep     : 1024 (pins system prompt ~700 tokens; passes 2-4 free)
 start_server_4vcpu_7b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
@@ -122,9 +131,6 @@ start_server_4vcpu_7b() {
 }
 
 # 2-vCPU ARM64 / 8 GB RAM / 3B model (private repo default)
-# Context  : 32768 (native window; 3B has dense MHA, larger KV than GQA)
-# Parallel : 1 (2 cores cannot sustain two inference slots; sequential wins)
-# Keep     : 768 (slightly smaller system prompt on 3B)
 start_server_2vcpu_3b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-3b-instruct-q4_k_m.gguf" \
@@ -139,9 +145,6 @@ start_server_2vcpu_3b() {
 }
 
 # 2-vCPU ARM64 / 8 GB RAM / 7B model (opt-in via MODEL_SIZE_OVERRIDE=7b)
-# Context  : 16384 (reduced to fit 7B weights + KV in 8 GB; ~2 GB margin)
-# Parallel : 1 (same reasoning as 3B on 2-vCPU)
-# Keep     : 1024 (system prompt still fits)
 start_server_2vcpu_7b() {
     _start_server \
         "$MODEL_DIR/qwen2.5-coder-7b-instruct-q4_k_m.gguf" \

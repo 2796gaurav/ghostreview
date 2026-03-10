@@ -9,7 +9,7 @@ dist/
 build/
 *.egg
 *.whl
-
+.ghostreview.md
 # Virtual environments
 venv/
 .env/

@@ -33,8 +33,6 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # Pinned llama.cpp tag — bump to upgrade, invalidates binary cache.
-      LLAMA_CPP_VERSION: "b8252"
       # Override model selection: "" = auto, "7b" = force 7B, "3b" = force 3B
       MODEL_SIZE_OVERRIDE: ""
 
@@ -43,14 +41,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # full history for accurate diffs
-
-      # ── Cache: llama-server binary (built from source on ARM64) ────
-      - name: Cache llama.cpp binary
-        uses: actions/cache@v4
-        id: llama-cache
-        with:
-          path: ~/.cache/ghost-review/llama-bin
-          key: ghost-review-llama-${{ runner.os }}-${{ runner.arch }}-${{ env.LLAMA_CPP_VERSION }}
 
       # ── Cache: GGUF model files (7B + 3B combined, ~6.9 GB) ────────
       - name: Cache LLM models
@@ -70,7 +60,7 @@ jobs:
           key: ghost-review-pip-${{ hashFiles('.github/scripts/requirements.txt') }}
           restore-keys: ghost-review-pip-
 
-      # ── Setup: build llama.cpp + download models + start server ────
+      # ── Setup: install llama.cpp + download models + start server ────
       - name: Setup inference engine
         run: bash .github/scripts/setup_inference.sh
 

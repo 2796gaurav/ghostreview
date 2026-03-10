@@ -14,10 +14,6 @@ inputs:
     description: 'Model size to use (auto, 7b, or 3b)'
     required: false
     default: 'auto'
-  llama-cpp-version:
-    description: 'llama.cpp version tag (e.g., b8252)'
-    required: false
-    default: 'b8252'
 
 outputs:
   risk-level:
@@ -32,13 +28,6 @@ runs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-
-    - name: Cache llama.cpp binary
-      uses: actions/cache@v4
-      id: llama-cache
-      with:
-        path: ~/.cache/ghost-review/llama-bin
-        key: ghost-review-llama-${{ runner.os }}-${{ runner.arch }}-${{ inputs.llama-cpp-version }}
 
     - name: Cache LLM models
       uses: actions/cache@v4
@@ -59,7 +48,6 @@ runs:
     - name: Setup inference engine
       shell: bash
       env:
-        LLAMA_CPP_VERSION: ${{ inputs.llama-cpp-version }}
         MODEL_SIZE_OVERRIDE: ${{ inputs.model-size }}
       run: bash ${{ github.action_path }}/.github/scripts/setup_inference.sh
 

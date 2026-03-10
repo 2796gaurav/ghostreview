@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # .github/scripts/setup_inference.sh
-# Master entrypoint: detect runner, download llama.cpp, download models, start server.
+# Master entrypoint: detect runner, install llama.cpp, download models, start server.
 # Must be run from the repository root after checkout.
 
 set -euo pipefail
@@ -14,7 +14,7 @@ source "$SCRIPT_DIR/lib/server.sh"
 # ── 1. Detect runner and select model ───────────────────────────────
 detect_runner_config
 
-# ── 2. Ensure llama.cpp binary is available ─────────────────────────
+# ── 2. Ensure llama.cpp is installed (via pip) ──────────────────────
 download_llama_cpp_if_needed
 
 # ── 3. Ensure model files are available ─────────────────────────────
